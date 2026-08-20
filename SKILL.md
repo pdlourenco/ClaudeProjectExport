@@ -80,6 +80,8 @@ Confirm what was saved: doc count, conversation count, output paths.
   (see README), pass the resulting file with `--mapping <path>` for an exact UUID join; add
   `--fuzzy` to let projects the mapping misses fall back to keyword matching. With `--mapping`,
   `--json` output gains a `strategy` field per project: `exact`, `fuzzy`, or `none`
+- With `--mapping`, `--unfiled <dir>` also saves conversations that belong to no project (or to
+  a project the user has since deleted — the export cannot tell these apart)
 - Duplicate docs within a project are automatically deduplicated by filename
 - `PYTHONIOENCODING=utf-8` is required on Windows to avoid emoji encoding errors
 - Pass `all` numbers to `--extract` for a full dump

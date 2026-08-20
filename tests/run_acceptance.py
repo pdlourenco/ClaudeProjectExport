@@ -134,6 +134,29 @@ def main():
         check("metadata-only project reports 0 docs without error",
               mapped["Lean Metadata Project"]["doc_count"] == 0)
 
+        # ── Unfiled bucket ───────────────────────────────────────────────────
+        print("\nUnfiled bucket")
+        uf_root = tmp / "uf"
+        proc = run(EXTRACTOR, zip_path, "--mapping", mapping_path,
+                   "--extract", "1,2,3",
+                   "--output", ",".join(str(uf_root / f"p{i}") for i in (1, 2, 3)),
+                   "--unfiled", uf_root / "_unfiled")
+        unfiled_files = sorted(p.name for p in (uf_root / "_unfiled").glob("*.md"))
+        check("unmapped conversations land in the unfiled bucket",
+              unfiled_files == ["Weeknight dinner ideas.md", "Zebra stripe measurements.md"],
+              ", ".join(unfiled_files))
+
+        total = len(make_fixture.CONVERSATIONS)
+        filed = sum(len(list((uf_root / f"p{i}" / "conversations").glob("*.md"))) for i in (1, 2, 3))
+        check("counts reconcile: filed + unfiled = total",
+              filed + len(unfiled_files) == total, f"{filed} filed + {len(unfiled_files)} unfiled = {total}")
+        check("reconciliation is reported on stdout",
+              "4 conversations filed under a project, 2 unfiled" in proc.stdout,
+              [l for l in proc.stdout.splitlines() if "unfiled" in l][:1])
+
+        run(EXTRACTOR, zip_path, "--unfiled", tmp / "never", expect_rc=1)
+        check("--unfiled without --mapping is a clean error", not (tmp / "never").exists())
+
         # ── Error handling ───────────────────────────────────────────────────
         print("\nError handling")
         bad = tmp / "bad"

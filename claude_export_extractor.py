@@ -26,6 +26,9 @@ Examples:
 
     # Exact join, falling back to keyword matching for projects the mapping misses
     python claude_export_extractor.py export.zip --mapping mapping.json --fuzzy
+
+    # Also save the conversations that belong to no project at all
+    python claude_export_extractor.py export.zip --mapping mapping.json --unfiled ./_unfiled
 """
 
 import zipfile
@@ -450,58 +453,102 @@ def extract_project(entry, output_dir: Path):
         conv_names = NameAllocator(conv_dir)
 
         for conv in entry["matched_conversations"]:
-            title = conv.get("name") or "Untitled"
-            conv_id = conv.get("uuid", "unknown")
-            created = ts(conv.get("created_at", ""))
-            updated = ts(conv.get("updated_at", ""))
-            messages = conv.get("chat_messages") or conv.get("messages") or []
-
-            lines = [
-                f"# {title}\n",
-                f"- **ID:** {conv_id}",
-                f"- **Created:** {created}",
-                f"- **Updated:** {updated}",
-                f"- **Messages:** {len(messages)}\n",
-                "---\n",
-            ]
-
-            for msg in messages:
-                role = (msg.get("sender") or msg.get("role") or "unknown").upper()
-                msg_ts = ts(msg.get("created_at", ""))
-
-                content = _extract_message_content(msg)
-
-                attachments = msg.get("attachments") or msg.get("files") or []
-                attach_notes = []
-                for att in attachments:
-                    fname = att.get("file_name") or att.get("name") or "attachment"
-                    ftype = att.get("file_type") or att.get("type") or ""
-                    attach_notes.append(f"[Attachment: {fname} ({ftype})]")
-                    # Save text-based attachment content
-                    att_content = att.get("extracted_content") or att.get("content") or ""
-                    if att_content and len(att_content) > 50:
-                        att_ext = detect_extension(att_content, fname)
-                        att_safe = safe_name(fname) + att_ext
-                        att_path = docs_dir / att_safe
-                        if not att_path.exists():
-                            att_path.write_text(att_content, encoding="utf-8",
-                                                errors="backslashreplace")
-
-                lines.append(f"### {role}  _{msg_ts}_\n")
-                if content:
-                    lines.append(content.strip())
-                    lines.append("")
-                for note in attach_notes:
-                    lines.append(f"> {note}")
-                if attach_notes:
-                    lines.append("")
-                lines.append("---\n")
-
-            out_path = conv_names.allocate(safe_name(title) + ".md")
-            out_path.write_text("\n".join(lines), encoding="utf-8",
-                                errors="backslashreplace")
+            stats["convs_msgs"] += write_conversation(conv, conv_dir, docs_dir)
             stats["conversations"] += 1
-            stats["convs_msgs"] += len(messages)
+
+    return stats
+
+
+def write_conversation(conv, conv_dir: Path, attach_dir: Path) -> int:
+    """Write one conversation to conv_dir as markdown; return its message count.
+
+    Text content from attachments is written alongside, into attach_dir.
+    """
+    title = conv.get("name") or "Untitled"
+    conv_id = conv.get("uuid", "unknown")
+    created = ts(conv.get("created_at", ""))
+    updated = ts(conv.get("updated_at", ""))
+    messages = conv.get("chat_messages") or conv.get("messages") or []
+
+    lines = [
+        f"# {title}\n",
+        f"- **ID:** {conv_id}",
+        f"- **Created:** {created}",
+        f"- **Updated:** {updated}",
+        f"- **Messages:** {len(messages)}\n",
+        "---\n",
+    ]
+
+    for msg in messages:
+        role = (msg.get("sender") or msg.get("role") or "unknown").upper()
+        msg_ts = ts(msg.get("created_at", ""))
+
+        content = _extract_message_content(msg)
+
+        attachments = msg.get("attachments") or msg.get("files") or []
+        attach_notes = []
+        for att in attachments:
+            fname = att.get("file_name") or att.get("name") or "attachment"
+            ftype = att.get("file_type") or att.get("type") or ""
+            attach_notes.append(f"[Attachment: {fname} ({ftype})]")
+            # Save text-based attachment content
+            att_content = att.get("extracted_content") or att.get("content") or ""
+            if att_content and len(att_content) > 50:
+                att_ext = detect_extension(att_content, fname)
+                att_safe = safe_name(fname) + att_ext
+                attach_dir.mkdir(parents=True, exist_ok=True)
+                att_path = attach_dir / att_safe
+                if not att_path.exists():
+                    att_path.write_text(att_content, encoding="utf-8")
+
+        lines.append(f"### {role}  _{msg_ts}_\n")
+        if content:
+            lines.append(content.strip())
+            lines.append("")
+        for note in attach_notes:
+            lines.append(f"> {note}")
+        if attach_notes:
+            lines.append("")
+        lines.append("---\n")
+
+    fname = safe_name(title) + ".md"
+    out_path = conv_dir / fname
+    counter = 1
+    while out_path.exists():
+        out_path = conv_dir / (safe_name(title) + f"_{counter}.md")
+        counter += 1
+
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    return len(messages)
+
+
+def unfiled_conversations(mapping, projects, conversations):
+    """Return conversations the mapping files under no project present in the export.
+
+    Two different situations land here and the export cannot tell them apart: a chat that
+    never belonged to a project, and a chat from a project that has since been deleted.
+    Both are equally unfiled as far as this tool can know, so both go to the same place.
+
+    Requires a mapping — keyword matching lets one conversation match several projects,
+    so there is no coherent notion of "unfiled" without an exact join.
+    """
+    project_uuids = {proj.get("uuid", "") for proj in projects}
+    unfiled = []
+    for conv in conversations:
+        entry = mapping["conversations"].get(conv.get("uuid"))
+        if not entry or entry["project_uuid"] not in project_uuids:
+            unfiled.append(conv)
+    return unfiled
+
+
+def extract_unfiled(conversations, output_dir: Path):
+    """Write every unfiled conversation into a single bucket directory."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stats = {"conversations": 0, "convs_msgs": 0}
+    for conv in conversations:
+        stats["convs_msgs"] += write_conversation(conv, output_dir, output_dir / "attachments")
+        stats["conversations"] += 1
 
     return stats
 
@@ -654,7 +701,7 @@ def interactive_mode(index, show_strategy: bool = False):
 
     if choice.lower() in ("q", "quit", "exit"):
         print("Cancelled.")
-        return
+        return False
 
     if choice.lower() == "all":
         selected = list(range(len(index)))
@@ -664,10 +711,10 @@ def interactive_mode(index, show_strategy: bool = False):
             for s in selected:
                 if s < 0 or s >= len(index):
                     print(f"Invalid number: {s+1}")
-                    return
+                    return False
         except ValueError:
             print("Invalid input. Enter numbers separated by commas.")
-            return
+            return False
 
     # Ask for output directories
     extractions = []
@@ -693,7 +740,7 @@ def interactive_mode(index, show_strategy: bool = False):
     confirm = prompt("Proceed? [Y/n] ").strip()
     if confirm.lower() in ("n", "no"):
         print("Cancelled.")
-        return
+        return False
 
     # Extract
     for entry, out_dir in extractions:
@@ -702,7 +749,7 @@ def interactive_mode(index, show_strategy: bool = False):
         print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
         print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
-    print("\nDone!")
+    return True
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -725,6 +772,9 @@ def main():
     parser.add_argument("--fuzzy", action="store_true",
                         help="Fall back to keyword matching for projects the mapping does not "
                              "cover. Without --mapping, keyword matching is used regardless.")
+    parser.add_argument("--unfiled", type=str, default=None, metavar="DIR",
+                        help="Also write conversations that belong to no project into DIR, "
+                             "e.g. ./_unfiled. Requires --mapping.")
 
     # A lone UTF-16 surrogate in a project or conversation name would otherwise abort the
     # run on the first print, before anything is written. JSON allows them, so survive them.
@@ -737,6 +787,11 @@ def main():
 
     if not zip_path.exists():
         print(f"ERROR: File not found: {zip_path}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.unfiled and not args.mapping:
+        print("ERROR: --unfiled requires --mapping — without an exact join there is no way to "
+              "tell which conversations are unfiled.", file=sys.stderr)
         sys.exit(1)
 
     mapping = None
@@ -776,6 +831,13 @@ def main():
                                 allow_fuzzy=(mapping is None or args.fuzzy))
     print(f"Found {len(index)} projects, {len(conversations)} conversations",
           file=sys.stderr if args.json else sys.stdout)
+
+    unfiled = []
+    if mapping:
+        unfiled = unfiled_conversations(mapping, projects, conversations)
+        print(f"Mapping: {len(conversations) - len(unfiled)} conversations filed under a project, "
+              f"{len(unfiled)} unfiled",
+              file=sys.stderr if args.json else sys.stdout)
 
     # JSON mode — machine-readable output for Claude Code
     if args.json:
@@ -820,11 +882,24 @@ def main():
             print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
             print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
+        _extract_unfiled(args.unfiled, unfiled)
         print("\nDone!")
         return
 
     # Interactive mode
-    interactive_mode(index, show_strategy=mapping is not None)
+    if interactive_mode(index, show_strategy=mapping is not None):
+        _extract_unfiled(args.unfiled, unfiled)
+        print("\nDone!")
+
+
+def _extract_unfiled(unfiled_dir, unfiled):
+    """Write the unfiled bucket, if one was asked for."""
+    if not unfiled_dir:
+        return
+    out_dir = Path(unfiled_dir)
+    print(f"\nExtracting unfiled conversations -> {out_dir}")
+    stats = extract_unfiled(unfiled, out_dir)
+    print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
 
 if __name__ == "__main__":

@@ -135,6 +135,20 @@ Each extracted project creates this organized layout:
     └── Architecture review.md
 ```
 
+With `--mapping`, you can also ask for the conversations that belong to no project at all —
+they're written once per run, to a directory of your choosing:
+
+```bash
+python claude_export_extractor.py export.zip --mapping mapping.json --unfiled ./_unfiled
+```
+
+```
+_unfiled/
+├── Weeknight dinner ideas.md
+├── Quick API question.md
+└── attachments/                # text extracted from attachments, if any
+```
+
 ## How Conversation Matching Works
 
 Claude.ai's export format **does not link conversations to projects** by ID — there's no
@@ -199,6 +213,27 @@ python claude_export_extractor.py export.zip --mapping mapping.json --fuzzy
 
 If the mapping was fetched before your export's most recent conversation activity, the tool
 warns that it may be stale and carries on — anything filed since the fetch simply looks unmapped.
+
+### Conversations in no project
+
+With a mapping in hand, the tool can also account for everything it *didn't* file. Each run
+reports the reconciliation:
+
+```
+Found 88 projects, 950 conversations
+Mapping: 731 conversations filed under a project, 219 unfiled
+```
+
+`--unfiled DIR` writes those 219 out. Be aware of what "unfiled" can mean: a conversation
+missing from the mapping is **either** a standalone chat that never belonged to a project
+**or** a chat from a project you have since deleted. Nothing in the export distinguishes the
+two, so the tool doesn't pretend to — both land in the same bucket. A conversation you started
+after fetching the mapping will also look unfiled; re-fetch if that matters.
+
+`--unfiled` requires `--mapping`: keyword matching can attach one conversation to several
+projects at once, so without an exact join there's no coherent notion of unfiled. Note that
+under `--fuzzy` a conversation can appear *both* in a project it was guessed into and in the
+unfiled bucket — the guess and the mapping disagree, and you can see both answers.
 
 ## Use Cases
 
