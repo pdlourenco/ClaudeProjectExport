@@ -75,7 +75,11 @@ Confirm what was saved: doc count, conversation count, output paths.
 
 ## Notes
 
-- Conversations are matched to projects by keyword similarity (no UUID link in export format)
+- Conversations are matched to projects by keyword similarity, because the export format carries
+  no project-to-conversation link. If the user can run `fetch_mapping.js` in a signed-in browser
+  (see README), pass the resulting file with `--mapping <path>` for an exact UUID join; add
+  `--fuzzy` to let projects the mapping misses fall back to keyword matching. With `--mapping`,
+  `--json` output gains a `strategy` field per project: `exact`, `fuzzy`, or `none`
 - Duplicate docs within a project are automatically deduplicated by filename
 - `PYTHONIOENCODING=utf-8` is required on Windows to avoid emoji encoding errors
 - Pass `all` numbers to `--extract` for a full dump

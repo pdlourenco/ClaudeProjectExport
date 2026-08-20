@@ -16,7 +16,7 @@ When you export your data from [Claude.ai](https://claude.ai), you get **one gia
 
 - **Interactive project picker** — see all your projects listed with doc counts, conversation counts, and sizes, then pick by number
 - **Selective extraction** — extract one project, multiple projects, or everything
-- **Smart conversation matching** — automatically finds conversations related to each project (Claude.ai exports don't link them)
+- **Exact conversation matching** — join conversations to projects by UUID using a mapping you fetch from your browser, instead of guessing from names (Claude.ai exports don't link them)
 - **Three modes** — interactive (human), JSON (automation), CLI (scripted)
 - **Zero dependencies** — pure Python 3.10+ stdlib, nothing to install
 - **Claude Code skill** — install as a `/ClaudeProjectExport` slash command
@@ -82,6 +82,18 @@ Then choose output directories for each, confirm, and extract.
 python claude_export_extractor.py export.zip --extract 1,3 --output "./research,./course"
 ```
 
+### Exact Conversation Matching (Recommended)
+
+By default the tool guesses which conversations belong to a project by comparing the project
+name to conversation titles. If you can open claude.ai in a browser, you can do better — see
+[How Conversation Matching Works](#how-conversation-matching-works) for the two-step workflow:
+
+```bash
+# 1. In your browser console on claude.ai, run fetch_mapping.js -> downloads mapping.json
+# 2. Point the extractor at it
+python claude_export_extractor.py export.zip --mapping mapping.json
+```
+
 ### JSON Mode (for Automation)
 
 ```bash
@@ -125,9 +137,68 @@ Each extracted project creates this organized layout:
 
 ## How Conversation Matching Works
 
-Claude.ai's export format **does not link conversations to projects** by ID — there's no `project_uuid` field on conversations. This tool matches conversations to projects using keyword similarity on the project name.
+Claude.ai's export format **does not link conversations to projects** by ID — there's no
+`project_uuid` field on conversations, and `projects.json` doesn't list its conversations.
+The tool offers two ways to bridge that gap.
 
-For example, a project named "NEU Marketing 2700" will match conversations containing "2700", "marketing", or "NEU" in their titles. This catches most relevant conversations but may occasionally include false positives.
+### Exact matching (recommended)
+
+The link does exist server-side, and a logged-in browser session can read it. `fetch_mapping.js`
+does exactly that and saves the result as `mapping.json`; the extractor then joins by UUID.
+
+**Step 1 — fetch the mapping**
+
+1. Sign in at [claude.ai](https://claude.ai)
+2. Open DevTools (`F12`, or `Cmd-Opt-I` on macOS) and go to the **Console** tab
+3. Paste the entire contents of [`fetch_mapping.js`](fetch_mapping.js) and press Enter
+4. Wait for it to finish — `mapping.json` downloads automatically
+
+**Step 2 — extract using it**
+
+```bash
+python claude_export_extractor.py export.zip --mapping mapping.json
+```
+
+Each project now reports how its conversations were matched:
+
+```
+  #  Project Name                                         Docs  Convos   Match      Size     Created
+───────────────────────────────────────────────────────────────────────────────────────────────────────
+  1  NEU Marketing 2700                                     12      28   exact    340 KB  2025-11-03
+  2  Course Materials                                        7       5   exact     78 KB  2026-01-15
+  3  Archived Ideas                                          3       0    none     12 KB  2026-03-20
+```
+
+> **⚠️ The endpoints `fetch_mapping.js` uses are undocumented and unversioned.** They are
+> Claude.ai's internal web-app APIs, not a published interface — Anthropic can change or remove
+> them at any time, and this script will break when they do. It reads no credentials and sends
+> nothing anywhere except claude.ai (it relies on the session cookie your browser already has),
+> but read it before you run it, and see the header comment for how to correct the paths if
+> they've moved.
+
+`mapping.json` contains your project and conversation names, so it's personal data —
+it's in `.gitignore` and shouldn't be committed anywhere. It's plain, pretty-printed JSON,
+so you can hand-edit it if a project was renamed or deleted.
+
+### Keyword matching (fallback)
+
+Without `--mapping`, the tool behaves exactly as it always has: it matches conversations using
+keyword similarity on the project name. A project named "NEU Marketing 2700" matches
+conversations containing "2700", "marketing", or "NEU" in their titles. This catches most
+relevant conversations but produces both false positives (generic project names match too much)
+and false negatives (a conversation titled "Ideas for the final capstone" belongs to that
+project but shares no vocabulary with it).
+
+When you supply `--mapping`, keyword matching is **off** by default: a project the mapping
+doesn't cover reports `none` and extracts no conversations, rather than quietly falling back to
+guesswork. Add `--fuzzy` to re-enable the fallback for uncovered projects:
+
+```bash
+python claude_export_extractor.py export.zip --mapping mapping.json --fuzzy
+```
+
+If the mapping was fetched before your export's most recent conversation activity, the tool
+warns that it may be stale and carries on — anything filed since the fetch simply looks unmapped.
 
 ## Use Cases
 
@@ -162,7 +233,11 @@ It extracts text content from attachments (the `extracted_content` field in the 
 
 ### Why aren't my conversations linked to the right project?
 
-Claude.ai's export format doesn't include a project-to-conversation link. The tool uses keyword matching on conversation titles, which works well for most cases but isn't perfect. Projects with very generic names (like "Test") may match too many conversations.
+Claude.ai's export format doesn't include a project-to-conversation link. Without `--mapping`
+the tool falls back to keyword matching on conversation titles, which works well for most cases
+but isn't perfect — projects with very generic names (like "Test") match too many conversations,
+and conversations whose titles don't echo the project name are missed entirely. Use
+[exact matching](#exact-matching-recommended) to get the real link.
 
 ### Can I extract conversations that aren't in any project?
 

@@ -9,6 +9,7 @@ Usage:
     python claude_export_extractor.py <path_to_zip>
     python claude_export_extractor.py <path_to_zip> --json       # machine-readable project list
     python claude_export_extractor.py <path_to_zip> --extract <project_nums> --output <dirs>
+    python claude_export_extractor.py <path_to_zip> --mapping mapping.json
 
 Examples:
     # Interactive mode — pick projects, set output dirs
@@ -19,6 +20,12 @@ Examples:
 
     # Non-interactive — extract projects 1,3 to specific dirs
     python claude_export_extractor.py export.zip --extract 1,3 --output "/path/one,/path/two"
+
+    # Exact conversation-to-project join, using a mapping produced by fetch_mapping.js
+    python claude_export_extractor.py export.zip --mapping mapping.json
+
+    # Exact join, falling back to keyword matching for projects the mapping misses
+    python claude_export_extractor.py export.zip --mapping mapping.json --fuzzy
 """
 
 import zipfile
@@ -27,7 +34,7 @@ import re
 import sys
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -175,14 +182,144 @@ def _as_projects(blob):
     return []
 
 
-def build_project_index(projects, conversations):
-    """Build an enriched index of projects with doc counts and matched conversations."""
+# ── Conversation mapping ──────────────────────────────────────────────────────
+
+MAPPING_SCHEMA = 1
+
+
+class MappingError(Exception):
+    """Raised when a mapping file is missing, malformed, or of an unknown schema."""
+
+
+def load_mapping(path: Path) -> dict:
+    """Load and validate an external conversation-to-project mapping file.
+
+    Claude.ai's export does not record which project a conversation belongs to, so the
+    mapping is produced separately from a logged-in browser session (see fetch_mapping.js)
+    and passed in with --mapping. Schema v1:
+
+        {
+          "schema": 1,
+          "fetched_at": "2026-08-20T10:00:00Z",
+          "org_uuid": "...",
+          "projects": {"<project_uuid>": "<project name>"},          # optional
+          "conversations": {
+            "<conversation_uuid>": {"project_uuid": "...", "project_name": "..."}
+          }
+        }
+
+    The optional "projects" key lists every project the fetch saw. It lets a project with
+    no conversations report an honest "exact" match of zero, rather than looking uncovered.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise MappingError(f"Mapping file not found: {path}")
+    except OSError as exc:
+        raise MappingError(f"Could not read mapping file {path}: {exc}")
+    except json.JSONDecodeError as exc:
+        raise MappingError(f"Mapping file is not valid JSON ({path}): {exc}")
+
+    if not isinstance(raw, dict):
+        raise MappingError(
+            f"Mapping file must contain a JSON object, found {type(raw).__name__}: {path}"
+        )
+
+    schema = raw.get("schema")
+    if schema != MAPPING_SCHEMA:
+        raise MappingError(
+            f"Unsupported mapping schema {schema!r} in {path} — this tool understands schema "
+            f"{MAPPING_SCHEMA}. Re-run fetch_mapping.js to produce a current mapping file."
+        )
+
+    convs = raw.get("conversations")
+    if not isinstance(convs, dict):
+        raise MappingError(f"Mapping file has no 'conversations' object: {path}")
+
+    cleaned = {}
+    for conv_uuid, entry in convs.items():
+        if not isinstance(entry, dict):
+            raise MappingError(
+                f"Mapping entry for conversation {conv_uuid} must be an object: {path}"
+            )
+        project_uuid = entry.get("project_uuid")
+        if not project_uuid:
+            raise MappingError(
+                f"Mapping entry for conversation {conv_uuid} has no 'project_uuid': {path}"
+            )
+        cleaned[conv_uuid] = {
+            "project_uuid": project_uuid,
+            "project_name": entry.get("project_name", ""),
+        }
+
+    projects = raw.get("projects")
+    if projects is not None and not isinstance(projects, dict):
+        raise MappingError(f"Mapping file's optional 'projects' key must be an object: {path}")
+
+    return {
+        "schema": schema,
+        "fetched_at": raw.get("fetched_at", ""),
+        "org_uuid": raw.get("org_uuid", ""),
+        "projects": projects or {},
+        "conversations": cleaned,
+    }
+
+
+def _parse_iso(value: str):
+    """Parse an ISO-8601 timestamp into an aware datetime, or None if unparseable."""
+    try:
+        dt = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def mapping_staleness(mapping, conversations):
+    """Return (fetched_at, newest_update) when the mapping predates the export, else None.
+
+    A mapping fetched before the export's most recent conversation activity cannot know
+    about anything created since. Those conversations are simply unmapped, so the result
+    is incomplete rather than wrong — worth a warning, not a refusal.
+    """
+    fetched = _parse_iso(mapping.get("fetched_at", ""))
+    if not fetched:
+        return None
+
+    newest = None
+    for conv in conversations:
+        updated = _parse_iso(conv.get("updated_at", ""))
+        if updated and (newest is None or updated > newest):
+            newest = updated
+
+    if newest and fetched < newest:
+        return fetched, newest
+    return None
+
+
+def build_project_index(projects, conversations, mapping=None, allow_fuzzy=True):
+    """Build an enriched index of projects with doc counts and matched conversations.
+
+    Conversations reach a project by one of three strategies, recorded per entry:
+      "exact" — joined by UUID through a mapping file (see load_mapping)
+      "fuzzy" — keyword similarity between the project name and conversation titles
+      "none"  — the mapping does not cover this project and fuzzy matching is off
+    """
     # Build keyword-to-conversation mapping
     conv_name_index = []
     for conv in conversations:
         name = (conv.get("name") or "").lower()
         msg_count = len(conv.get("chat_messages") or conv.get("messages") or [])
         conv_name_index.append((name, msg_count, conv))
+
+    # Exact join: group conversations under the project UUID the mapping assigns them.
+    by_project = defaultdict(list)
+    covered = set()
+    if mapping:
+        for conv in conversations:
+            entry = mapping["conversations"].get(conv.get("uuid"))
+            if entry:
+                by_project[entry["project_uuid"]].append(conv)
+        covered = set(mapping["projects"]) or set(by_project)
 
     index = []
     for proj in projects:
@@ -209,12 +346,13 @@ def build_project_index(projects, conversations):
         # Count total content size
         total_kb = sum(len(d.get("content", "")) for d in unique_docs) / 1024
 
-        # Match conversations by project name keywords
-        keywords = _project_keywords(name)
-        matched_convos = []
-        for cname, mcnt, conv in conv_name_index:
-            if any(k in cname for k in keywords):
-                matched_convos.append(conv)
+        # Attach conversations: exact where the mapping covers this project, else keywords
+        if mapping and uuid in covered:
+            matched_convos, strategy = by_project.get(uuid, []), "exact"
+        elif allow_fuzzy:
+            matched_convos, strategy = _keyword_match(name, conv_name_index), "fuzzy"
+        else:
+            matched_convos, strategy = [], "none"
 
         index.append({
             "name": name,
@@ -227,9 +365,20 @@ def build_project_index(projects, conversations):
             "total_kb": total_kb,
             "matched_conversations": matched_convos,
             "conv_count": len(matched_convos),
+            "strategy": strategy,
         })
 
     return index
+
+
+def _keyword_match(project_name: str, conv_name_index) -> list:
+    """Return conversations whose title contains any keyword from the project name."""
+    keywords = _project_keywords(project_name)
+    matched_convos = []
+    for cname, mcnt, conv in conv_name_index:
+        if any(k in cname for k in keywords):
+            matched_convos.append(conv)
+    return matched_convos
 
 
 def _project_keywords(project_name: str) -> list:
@@ -402,22 +551,34 @@ def _extract_message_content(msg) -> str:
 
 # ── Display ───────────────────────────────────────────────────────────────────
 
-def print_project_list(index):
-    """Print a numbered list of projects."""
-    print(f"\n{'#':>3}  {'Project Name':<50}  {'Docs':>5}  {'Convos':>6}  {'Size':>8}  {'Created':>10}")
-    print("─" * 95)
+def print_project_list(index, show_strategy: bool = False):
+    """Print a numbered list of projects.
+
+    The match-strategy column only appears when a mapping is in play; without one every
+    project is matched the same way and the column carries no information.
+    """
+    header = [f"{'#':>3}", f"{'Project Name':<50}", f"{'Docs':>5}", f"{'Convos':>6}"]
+    if show_strategy:
+        header.append(f"{'Match':>6}")
+    header += [f"{'Size':>8}", f"{'Created':>10}"]
+    print("\n" + "  ".join(header))
+    print("─" * (103 if show_strategy else 95))
     for i, entry in enumerate(index, 1):
         name = entry["name"][:48]
         size = f"{entry['total_kb']:.0f} KB" if entry["total_kb"] < 1024 else f"{entry['total_kb']/1024:.1f} MB"
-        print(f"{i:>3}  {name:<50}  {entry['doc_count']:>5}  {entry['conv_count']:>6}  {size:>8}  {entry['created']:>10}")
+        row = [f"{i:>3}", f"{name:<50}", f"{entry['doc_count']:>5}", f"{entry['conv_count']:>6}"]
+        if show_strategy:
+            row.append(f"{entry['strategy']:>6}")
+        row += [f"{size:>8}", f"{entry['created']:>10}"]
+        print("  ".join(row))
     print(f"\nTotal: {len(index)} projects")
 
 
-def print_json_index(index):
+def print_json_index(index, show_strategy: bool = False):
     """Print machine-readable JSON index for Claude Code skill automation."""
     output = []
     for i, entry in enumerate(index, 1):
-        output.append({
+        record = {
             "number": i,
             "name": entry["name"],
             "uuid": entry["uuid"],
@@ -427,7 +588,10 @@ def print_json_index(index):
             "conv_count": entry["conv_count"],
             "total_kb": round(entry["total_kb"], 1),
             "has_prompt": bool(entry["prompt_template"]),
-        })
+        }
+        if show_strategy:
+            record["strategy"] = entry["strategy"]
+        output.append(record)
     print(json.dumps(output, indent=2))
 
 
@@ -480,11 +644,9 @@ def extract_or_exit(entry, out_dir: Path):
         sys.exit(1)
 
 
-
-
-def interactive_mode(index):
+def interactive_mode(index, show_strategy: bool = False):
     """Run interactive project selection and extraction."""
-    print_project_list(index)
+    print_project_list(index, show_strategy)
 
     print("\nEnter project numbers to extract (comma-separated, e.g. '1,3,5')")
     print("Or 'all' to extract everything, or 'q' to quit:")
@@ -525,7 +687,8 @@ def interactive_mode(index):
     for entry, out_dir in extractions:
         print(f"  {entry['name']}")
         print(f"    -> {out_dir}")
-        print(f"    {entry['doc_count']} docs, {entry['conv_count']} conversations")
+        matched_by = f" ({entry['strategy']} match)" if show_strategy else ""
+        print(f"    {entry['doc_count']} docs, {entry['conv_count']} conversations{matched_by}")
     print()
     confirm = prompt("Proceed? [Y/n] ").strip()
     if confirm.lower() in ("n", "no"):
@@ -555,6 +718,13 @@ def main():
                         help="Comma-separated project numbers to extract (non-interactive)")
     parser.add_argument("--output", type=str, default=None,
                         help="Comma-separated output directories (one per project)")
+    parser.add_argument("--mapping", type=str, default=None,
+                        help="Path to a conversation-to-project mapping file produced by "
+                             "fetch_mapping.js. Joins conversations to projects by UUID "
+                             "instead of guessing from names.")
+    parser.add_argument("--fuzzy", action="store_true",
+                        help="Fall back to keyword matching for projects the mapping does not "
+                             "cover. Without --mapping, keyword matching is used regardless.")
 
     # A lone UTF-16 surrogate in a project or conversation name would otherwise abort the
     # run on the first print, before anything is written. JSON allows them, so survive them.
@@ -568,6 +738,14 @@ def main():
     if not zip_path.exists():
         print(f"ERROR: File not found: {zip_path}", file=sys.stderr)
         sys.exit(1)
+
+    mapping = None
+    if args.mapping:
+        try:
+            mapping = load_mapping(Path(args.mapping))
+        except MappingError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     print(f"Loading: {zip_path}", file=sys.stderr if args.json else sys.stdout)
     try:
@@ -584,13 +762,24 @@ def main():
     except OSError as exc:
         print(f"ERROR: Could not read {zip_path}: {exc}", file=sys.stderr)
         sys.exit(1)
-    index = build_project_index(projects, conversations)
+
+    if mapping:
+        stale = mapping_staleness(mapping, conversations)
+        if stale:
+            fetched, newest = (dt.astimezone(timezone.utc) for dt in stale)
+            print(f"WARNING: mapping was fetched {fetched:%Y-%m-%d %H:%M UTC} but the export has "
+                  f"conversation activity up to {newest:%Y-%m-%d %H:%M UTC}. Anything filed since "
+                  f"the fetch will look unmapped — re-run fetch_mapping.js for a current mapping.",
+                  file=sys.stderr)
+
+    index = build_project_index(projects, conversations, mapping=mapping,
+                                allow_fuzzy=(mapping is None or args.fuzzy))
     print(f"Found {len(index)} projects, {len(conversations)} conversations",
           file=sys.stderr if args.json else sys.stdout)
 
     # JSON mode — machine-readable output for Claude Code
     if args.json:
-        print_json_index(index)
+        print_json_index(index, show_strategy=mapping is not None)
         return
 
     # Non-interactive mode — extract specified projects
@@ -635,7 +824,7 @@ def main():
         return
 
     # Interactive mode
-    interactive_mode(index)
+    interactive_mode(index, show_strategy=mapping is not None)
 
 
 if __name__ == "__main__":
