@@ -479,16 +479,19 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False):
         conv_names = NameAllocator(conv_dir)
 
         for conv in entry["matched_conversations"]:
-            stats["convs_msgs"] += write_conversation(conv, conv_dir, docs_dir)
+            stats["convs_msgs"] += write_conversation(conv, conv_names, docs_dir)
             stats["conversations"] += 1
 
     return stats
 
 
-def write_conversation(conv, conv_dir: Path, attach_dir: Path) -> int:
-    """Write one conversation to conv_dir as markdown; return its message count.
+def write_conversation(conv, names: NameAllocator, attach_dir: Path) -> int:
+    """Write one conversation as markdown, via `names`; return its message count.
 
-    Text content from attachments is written alongside, into attach_dir.
+    Text content from attachments is written alongside, into attach_dir. The allocator is
+    passed in rather than built here so that a whole directory's worth of conversations
+    shares one — conversations sharing a title need to see each other's names, and a
+    directory left over from an earlier run needs to be refreshed rather than duplicated.
     """
     title = conv.get("name") or "Untitled"
     conv_id = conv.get("uuid", "unknown")
@@ -525,7 +528,8 @@ def write_conversation(conv, conv_dir: Path, attach_dir: Path) -> int:
                 attach_dir.mkdir(parents=True, exist_ok=True)
                 att_path = attach_dir / att_safe
                 if not att_path.exists():
-                    att_path.write_text(att_content, encoding="utf-8")
+                    att_path.write_text(att_content, encoding="utf-8",
+                                        errors="backslashreplace")
 
         lines.append(f"### {role}  _{msg_ts}_\n")
         if content:
@@ -537,14 +541,8 @@ def write_conversation(conv, conv_dir: Path, attach_dir: Path) -> int:
             lines.append("")
         lines.append("---\n")
 
-    fname = safe_name(title) + ".md"
-    out_path = conv_dir / fname
-    counter = 1
-    while out_path.exists():
-        out_path = conv_dir / (safe_name(title) + f"_{counter}.md")
-        counter += 1
-
-    out_path.write_text("\n".join(lines), encoding="utf-8")
+    out_path = names.allocate(safe_name(title) + ".md")
+    out_path.write_text("\n".join(lines), encoding="utf-8", errors="backslashreplace")
     return len(messages)
 
 
@@ -594,8 +592,9 @@ def extract_unfiled(conversations, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stats = {"conversations": 0, "convs_msgs": 0}
+    names = NameAllocator(output_dir)
     for conv in conversations:
-        stats["convs_msgs"] += write_conversation(conv, output_dir, output_dir / "attachments")
+        stats["convs_msgs"] += write_conversation(conv, names, output_dir / "attachments")
         stats["conversations"] += 1
 
     return stats

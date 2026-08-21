@@ -27,7 +27,8 @@ EXTRACTOR = ROOT / "claude_export_extractor.py"
 # feature", so the baseline is the commit this work sits on — the export-loading fix — not
 # main. Both give the same answer on the fixture's legacy layout, but only the first is right
 # in principle, and it stays right if the fixture ever moves to the per-project layout.
-BASELINE_REFS = ("claude/load-all-projects-from-export", "main")
+BASELINE_REFS = ("claude/fix-silent-data-loss-and-crashes",
+                 "claude/load-all-projects-from-export", "main")
 
 STDLIB_ALLOWED = {"zipfile", "json", "re", "sys", "argparse", "pathlib", "datetime", "collections"}
 
