@@ -328,7 +328,10 @@ def build_project_index(projects, conversations, mapping=None, allow_fuzzy=True)
             entry = mapping["conversations"].get(conv.get("uuid"))
             if entry:
                 by_project[entry["project_uuid"]].append(conv)
-        covered = set(mapping["projects"]) or set(by_project)
+        # Union, not a fallback: "projects" exists so a project with no conversations can
+        # still report an honest exact match of zero, but a hand-edited mapping whose
+        # "projects" omits a project its conversations reference must not strand them.
+        covered = set(mapping["projects"]) | set(by_project)
 
     # Keyword matching draws only from conversations the mapping leaves unfiled. The mapping
     # is authoritative: an uncovered project has no business guessing at a conversation that

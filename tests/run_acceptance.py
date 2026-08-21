@@ -145,6 +145,31 @@ def main():
         check("--fuzzy does not disturb covered projects",
               all(fuzzy[n]["strategy"] == "exact" for n in ("Marketing Course 2700", "Lean Metadata Project")))
 
+        # A mapping whose "projects" omits a project its own conversations reference must not
+        # strand them: the project is uncovered, but its conversations are excluded from the
+        # keyword pool because the mapping does file them, so they would reach nothing at all.
+        omit = json.loads(mapping_path.read_text(encoding="utf-8"))
+        omit["projects"] = {k: v for k, v in omit["projects"].items() if k != make_fixture.P1}
+        omit_path = tmp / "omits_a_project.json"
+        omit_path.write_text(json.dumps(omit, indent=2), encoding="utf-8")
+        patched = {e["name"]: e for e in index_json(zip_path, "--mapping", omit_path, "--fuzzy")}
+        check("a project missing from the mapping's 'projects' keeps its mapped conversations",
+              patched["Marketing Course 2700"]["strategy"] == "exact"
+              and patched["Marketing Course 2700"]["conv_count"] == 3,
+              f"{patched['Marketing Course 2700']['conv_count']} convs, "
+              f"{patched['Marketing Course 2700']['strategy']}")
+
+        # ...while the reason that key exists still works: a project registered there with no
+        # conversations reports an honest exact match of zero rather than looking uncovered.
+        empty = json.loads(mapping_path.read_text(encoding="utf-8"))
+        empty["projects"][make_fixture.P3] = "Zebra Analysis"
+        empty_path = tmp / "zero_conversation_project.json"
+        empty_path.write_text(json.dumps(empty, indent=2), encoding="utf-8")
+        zeroed = {e["name"]: e for e in index_json(zip_path, "--mapping", empty_path, "--fuzzy")}
+        check("a mapped project with no conversations reports exact, not fuzzy",
+              zeroed["Zebra Analysis"]["strategy"] == "exact"
+              and zeroed["Zebra Analysis"]["conv_count"] == 0)
+
         plain = index_json(zip_path)
         check("strategy key absent without --mapping",
               all("strategy" not in e for e in plain))

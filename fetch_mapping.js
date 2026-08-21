@@ -93,16 +93,26 @@
 
   // Pagination cursor, under whichever key this endpoint version uses.
   function nextCursor(body, page) {
-    if (Array.isArray(body)) return null;
-    if (body?.has_more === false) return null;
-    const cursor = body?.last_id ?? body?.next_cursor ?? body?.cursor ?? null;
+    // An explicit has_more:false is authoritative — no cursor, and nothing left behind.
+    if (!Array.isArray(body) && body?.has_more === false) return null;
+
+    const cursor = Array.isArray(body)
+      ? null
+      : body?.last_id ?? body?.next_cursor ?? body?.cursor ?? null;
     if (cursor) return cursor;
-    // A full page with no cursor field means we cannot tell whether more exist.
+
+    // A full page and no way to ask for the next one: we cannot tell whether more exist.
+    // This has to fire for bare-array responses too — an endpoint that returns a plain
+    // array is exactly the case where pagination would stop after page one in silence,
+    // and the conversations left behind would just look unfiled to the extractor.
     if (page.length >= PAGE_SIZE) {
+      const shape = Array.isArray(body)
+        ? "the response is a bare array, with no pagination envelope"
+        : `response keys: [${Object.keys(body || {}).join(", ")}]`;
       console.warn(
-        `  ! Got a full page of ${page.length} with no pagination cursor. Response keys: ` +
-        `[${Object.keys(body || {}).join(", ")}]. Some conversations may be missing — ` +
-        `update nextCursor() in this script to read the right key.`
+        `  ! Got a full page of ${page.length} with no pagination cursor — ${shape}. ` +
+        `Conversations may be missing. Check how the real endpoint paginates and update ` +
+        `nextCursor() (and ENDPOINTS.projectConversations) in this script to match.`
       );
     }
     return null;
