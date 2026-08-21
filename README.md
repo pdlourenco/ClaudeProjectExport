@@ -200,18 +200,24 @@ so you can hand-edit it if a project was renamed or deleted.
 #### What `exact` does and doesn't promise
 
 `exact` means every conversation in that project came from the mapping rather than a guess. It
-does **not** promise the project is complete. The mapping records what claude.ai returned at the
-moment you fetched it, and your export can contain conversations it didn't:
+does **not** promise the project is complete — the mapping records only what claude.ai returned
+at the moment you fetched it. Two things can leave a covered project short:
 
-- a conversation deleted from the project in the web app, which the fetch no longer sees but
-  the export may still carry
-- a conversation you started after fetching the mapping
+- **A conversation created or filed after the fetch.** Re-fetch; the staleness warning exists to
+  tell you when this is possible.
+- **A truncated fetch.** If `fetch_mapping.js` failed to follow pagination for a project, that
+  project is quietly missing conversations while still reporting `exact`. The script warns on the
+  console when it sees a full page it can't get a cursor for — don't ignore that warning.
 
-Neither is guessed back into the project — keyword matching never runs for a covered project, so
-`exact` stays exact and no project ever mixes joined and guessed conversations. Those
-conversations surface in the unfiled count instead, where you can see them. If one of them
-really does belong to a project, add it to `mapping.json` by hand and re-run; that's what the
-file is pretty-printed for. Re-fetching is the cure for the second case.
+A conversation you *removed* from a project is a different matter: it genuinely doesn't belong to
+that project any more, so leaving it unfiled is the right answer, not a gap. Likewise a deleted
+project — it isn't in your export either, so there is nothing to file into.
+
+None of these are guessed back into a covered project: keyword matching never runs for a project
+the mapping covers, so `exact` stays exact and no project ever mixes joined and guessed
+conversations. Anything missing surfaces in the unfiled count instead, where you can see it. If
+one of those really does belong to a project, add it to `mapping.json` by hand and re-run —
+that's what the file is pretty-printed for.
 
 ### Keyword matching (fallback)
 

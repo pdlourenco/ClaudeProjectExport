@@ -308,10 +308,10 @@ def build_project_index(projects, conversations, mapping=None, allow_fuzzy=True)
       "none"  — the mapping does not cover this project and fuzzy matching is off
 
     "exact" means none of the project's conversations were guessed at. It does not mean the
-    project is complete: a conversation deleted from the project server-side, or started after
-    the mapping was fetched, is in the export but not in the mapping. Keyword matching is not
-    used to fill those gaps — a covered project never falls back — so no project mixes joined
-    and guessed conversations. Such conversations end up unfiled, where they are visible.
+    project is complete: a conversation created after the mapping was fetched, or missed by a
+    truncated fetch, is in the export but not in the mapping. Keyword matching is not used to
+    fill those gaps — a covered project never falls back — so no project mixes joined and
+    guessed conversations. Such conversations end up unfiled, where they are visible.
     """
     # Build keyword-to-conversation mapping
     conv_name_index = []
