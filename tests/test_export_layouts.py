@@ -76,13 +76,19 @@ CONVERSATIONS = [
     },
 ]
 
+passes = []
 failures = []
+skipped = []
 
 
 def check(name, ok, detail=""):
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
-    if not ok:
-        failures.append(name)
+    (passes if ok else failures).append(name)
+
+
+def skip(name, detail):
+    print(f"  [SKIP] {name} — {detail}")
+    skipped.append(name)
 
 
 def write_legacy(path: Path):
@@ -140,9 +146,10 @@ def main():
         check("legacy layout output unchanged from main",
               index(tmp / "legacy.zip", baseline) == legacy)
     except (OSError, subprocess.CalledProcessError) as exc:
-        print(f"  [SKIP] legacy layout output unchanged from main — {exc}")
+        skip("legacy layout output unchanged from main", str(exc))
 
-    print(f"\n{4 - len(failures)} passed, {len(failures)} failed")
+    summary = f"\n{len(passes)} passed, {len(failures)} failed"
+    print(summary + (f", {len(skipped)} skipped" if skipped else ""))
     return 1 if failures else 0
 
 
