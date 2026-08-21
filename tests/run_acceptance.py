@@ -23,7 +23,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EXTRACTOR = ROOT / "claude_export_extractor.py"
-BASELINE_REF = "main:claude_export_extractor.py"
+# The backwards-compatibility claim is "no --mapping behaves exactly as it did before this
+# feature", so the baseline is the commit this work sits on — the export-loading fix — not
+# main. Both give the same answer on the fixture's legacy layout, but only the first is right
+# in principle, and it stays right if the fixture ever moves to the per-project layout.
+BASELINE_REFS = ("claude/load-all-projects-from-export", "main")
 
 STDLIB_ALLOWED = {"zipfile", "json", "re", "sys", "argparse", "pathlib", "datetime", "collections"}
 
@@ -76,35 +80,45 @@ def main():
         # ── Backwards compatibility ──────────────────────────────────────────
         print("Backwards compatibility")
         baseline = tmp / "baseline_extractor.py"
-        try:
-            src = subprocess.run(["git", "-C", str(ROOT), "show", BASELINE_REF],
-                                 capture_output=True, text=True, check=True).stdout
+        ref = None
+        for candidate in BASELINE_REFS:
+            try:
+                src = subprocess.run(
+                    ["git", "-C", str(ROOT), "show", f"{candidate}:claude_export_extractor.py"],
+                    capture_output=True, text=True, check=True).stdout
+            except (OSError, subprocess.CalledProcessError):
+                continue
             baseline.write_text(src, encoding="utf-8")
-        except (OSError, subprocess.CalledProcessError) as exc:
+            ref = candidate
+            break
+        if ref is None:
             baseline = None
-            skip("output identical to main without --mapping", f"cannot read {BASELINE_REF} ({exc})")
+            skip("output identical to the base branch without --mapping",
+                 f"none of {BASELINE_REFS} could be read")
+        else:
+            print(f"  (baseline: {ref})")
 
         if baseline:
             base_json = run(baseline, zip_path, "--json")
             new_json = run(EXTRACTOR, zip_path, "--json")
-            check("--json output identical to main",
+            check("--json output identical to the base branch",
                   (base_json.stdout, base_json.stderr) == (new_json.stdout, new_json.stderr))
 
             base_picker = run(baseline, zip_path)
             new_picker = run(EXTRACTOR, zip_path)
-            check("interactive picker identical to main", base_picker.stdout == new_picker.stdout)
+            check("interactive picker identical to the base branch", base_picker.stdout == new_picker.stdout)
 
             base_dir, new_dir = tmp / "base_out", tmp / "new_out"
             base_out = run(baseline, zip_path, "--extract", "1,2,3,4",
                            "--output", ",".join(str(base_dir / f"p{i}") for i in (1, 2, 3, 4)))
             new_out = run(EXTRACTOR, zip_path, "--extract", "1,2,3,4",
                           "--output", ",".join(str(new_dir / f"p{i}") for i in (1, 2, 3, 4)))
-            check("extraction stdout identical to main",
+            check("extraction stdout identical to the base branch",
                   normalise(base_out.stdout, base_dir) == normalise(new_out.stdout, new_dir))
             base_tree = {k: normalise(v, base_dir) for k, v in tree(base_dir).items()}
             new_tree = {k: normalise(v, new_dir) for k, v in tree(new_dir).items()}
             differing = [k for k in base_tree if base_tree.get(k) != new_tree.get(k)]
-            check("extracted files identical to main",
+            check("extracted files identical to the base branch",
                   base_tree.keys() == new_tree.keys() and not differing,
                   f"{len(base_tree)} files compared" if not differing else f"differ: {differing}")
 
