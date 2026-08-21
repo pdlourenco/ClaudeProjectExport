@@ -82,45 +82,42 @@ def detect_extension(content: str, filename: str = "") -> str:
     return ".txt"
 
 
-def written_form(content: str) -> str:
-    """What `content` looks like once written, given writes use errors="backslashreplace"."""
-    return content.encode("utf-8", errors="backslashreplace").decode("utf-8")
+class NameAllocator:
+    """Hands out write paths within one directory, disambiguating collisions as name_1.ext.
 
+    Sanitizing and truncating filenames makes distinct source names collide (a/b.txt and
+    a\\b.txt both sanitize to a_b.txt; two names differing past character 80 both truncate
+    to the same thing), so writing blind loses documents silently.
 
-def holds_content(path: Path, content: str) -> bool:
-    """True if `path` already contains exactly what we are about to write to it."""
-    try:
-        return path.read_text(encoding="utf-8") == written_form(content)
-    except (OSError, UnicodeDecodeError):
-        return False
+    A name handed out earlier in this run is never handed out again. A file left over from
+    an *earlier* run is overwritten, so re-extracting into the same directory refreshes it
+    in place rather than accumulating a copy of every document per run. Names the caller
+    reserves up front — the metadata and prompt files — are treated as already taken.
 
-
-def unique_path(directory: Path, filename: str, counters: dict, content=None) -> Path:
-    """Return a path in `directory` to write to, disambiguating collisions as name_1.ext.
-
-    Sanitizing and truncating filenames makes distinct source names collide, so writing
-    blind loses documents silently. `counters` remembers where each name got to, so a
-    directory full of same-named files costs one probe apiece instead of rescanning from
-    _1 every time. The caller is expected to write the file before asking for another.
-
-    Pass `content` when the file's bytes are already known: a candidate that holds exactly
-    that content is handed back for rewriting rather than treated as a collision, so
-    re-extracting into a directory converges instead of adding a copy of every file on
-    every run. Without it, every existing name counts as a collision.
+    Each name resumes from its own counter, so a directory full of identically-named files
+    costs one step apiece instead of rescanning from _1 every time.
     """
-    stem, dot, ext = filename.rpartition(".")
-    if dot:
-        ext = "." + ext
-    else:
-        stem, ext = filename, ""
 
-    counter = counters.get(filename, 0)
-    while True:
-        candidate = directory / (filename if counter == 0 else f"{stem}_{counter}{ext}")
-        counter += 1
-        if not candidate.exists() or (content is not None and holds_content(candidate, content)):
-            counters[filename] = counter
-            return candidate
+    def __init__(self, directory: Path, reserved=()):
+        self.directory = directory
+        self.counters = {}
+        self.allocated = set(reserved)
+
+    def allocate(self, filename: str) -> Path:
+        stem, dot, ext = filename.rpartition(".")
+        if dot:
+            ext = "." + ext
+        else:
+            stem, ext = filename, ""
+
+        counter = self.counters.get(filename, 0)
+        while True:
+            candidate = filename if counter == 0 else f"{stem}_{counter}{ext}"
+            counter += 1
+            if candidate not in self.allocated:
+                self.counters[filename] = counter
+                self.allocated.add(candidate)
+                return self.directory / candidate
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -281,7 +278,11 @@ def extract_project(entry, output_dir: Path):
         )
 
     # ── Extract knowledge docs ───────────────────────────────────────────
-    doc_names = {}
+    # The metadata and prompt files were written above, and the allocator overwrites files
+    # it did not hand out. safe_name strips leading underscores, so nothing can currently
+    # sanitize onto those names — reserving them keeps that from silently ceasing to be
+    # true if safe_name changes.
+    docs = NameAllocator(docs_dir, reserved=("_project_metadata.json", "_prompt_template.md"))
     for doc in entry["docs"]:
         filename = doc.get("filename", "untitled")
         content = doc.get("content", "")
@@ -289,7 +290,7 @@ def extract_project(entry, output_dir: Path):
             continue
 
         ext = detect_extension(content, filename)
-        out_path = unique_path(docs_dir, safe_name(filename) + ext, doc_names, content)
+        out_path = docs.allocate(safe_name(filename) + ext)
         out_path.write_text(content, encoding="utf-8", errors="backslashreplace")
         stats["docs"] += 1
         stats["docs_kb"] += len(content) / 1024
@@ -297,7 +298,7 @@ def extract_project(entry, output_dir: Path):
     # ── Extract conversations ────────────────────────────────────────────
     if entry["matched_conversations"]:
         conv_dir.mkdir(exist_ok=True)
-        conv_names = {}
+        conv_names = NameAllocator(conv_dir)
 
         for conv in entry["matched_conversations"]:
             title = conv.get("name") or "Untitled"
@@ -347,7 +348,7 @@ def extract_project(entry, output_dir: Path):
                     lines.append("")
                 lines.append("---\n")
 
-            out_path = unique_path(conv_dir, safe_name(title) + ".md", conv_names)
+            out_path = conv_names.allocate(safe_name(title) + ".md")
             out_path.write_text("\n".join(lines), encoding="utf-8",
                                 errors="backslashreplace")
             stats["conversations"] += 1
