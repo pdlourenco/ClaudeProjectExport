@@ -82,13 +82,31 @@ def detect_extension(content: str, filename: str = "") -> str:
     return ".txt"
 
 
-def unique_path(directory: Path, filename: str, counters: dict) -> Path:
-    """Return an unused path in `directory`, disambiguating collisions as name_1.ext.
+def written_form(content: str) -> str:
+    """What `content` looks like once written, given writes use errors="backslashreplace"."""
+    return content.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+
+def holds_content(path: Path, content: str) -> bool:
+    """True if `path` already contains exactly what we are about to write to it."""
+    try:
+        return path.read_text(encoding="utf-8") == written_form(content)
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def unique_path(directory: Path, filename: str, counters: dict, content=None) -> Path:
+    """Return a path in `directory` to write to, disambiguating collisions as name_1.ext.
 
     Sanitizing and truncating filenames makes distinct source names collide, so writing
     blind loses documents silently. `counters` remembers where each name got to, so a
     directory full of same-named files costs one probe apiece instead of rescanning from
     _1 every time. The caller is expected to write the file before asking for another.
+
+    Pass `content` when the file's bytes are already known: a candidate that holds exactly
+    that content is handed back for rewriting rather than treated as a collision, so
+    re-extracting into a directory converges instead of adding a copy of every file on
+    every run. Without it, every existing name counts as a collision.
     """
     stem, dot, ext = filename.rpartition(".")
     if dot:
@@ -98,11 +116,11 @@ def unique_path(directory: Path, filename: str, counters: dict) -> Path:
 
     counter = counters.get(filename, 0)
     while True:
-        candidate = filename if counter == 0 else f"{stem}_{counter}{ext}"
+        candidate = directory / (filename if counter == 0 else f"{stem}_{counter}{ext}")
         counter += 1
-        if not (directory / candidate).exists():
+        if not candidate.exists() or (content is not None and holds_content(candidate, content)):
             counters[filename] = counter
-            return directory / candidate
+            return candidate
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -271,7 +289,7 @@ def extract_project(entry, output_dir: Path):
             continue
 
         ext = detect_extension(content, filename)
-        out_path = unique_path(docs_dir, safe_name(filename) + ext, doc_names)
+        out_path = unique_path(docs_dir, safe_name(filename) + ext, doc_names, content)
         out_path.write_text(content, encoding="utf-8", errors="backslashreplace")
         stats["docs"] += 1
         stats["docs_kb"] += len(content) / 1024

@@ -178,6 +178,22 @@ def probe_doc_same_name_diff_content():
         report("OK", "duplicate filename with different content -> both docs kept")
 
 
+def probe_rerun_into_same_dir():
+    d = fresh("rerun")
+    docs = [doc("notes.md", "# Notes\n"), doc("spec.json", '{"a": 1}\n')]
+    zp = make_zip(d, [proj("Alpha", docs)], [])
+    out = d / "out"
+    run(zp, "--extract", "1", "--output", out)
+    first = sorted(f.name for f in (out / "project_knowledge").iterdir())
+    run(zp, "--extract", "1", "--output", out)
+    second = sorted(f.name for f in (out / "project_knowledge").iterdir())
+    if first != second:
+        report("WEIRD", "re-extracting into the same directory duplicates every doc",
+               f"{first} -> {second}; a retry after an interrupted run should converge")
+    else:
+        report("OK", "re-extracting into the same directory converges")
+
+
 def probe_conv_title_collision():
     d = fresh("conv_collide")
     convs = [conv("Chat: one", "c-1"), conv("Chat? one", "c-2")]
@@ -389,7 +405,8 @@ def main():
     WORK.mkdir(exist_ok=True)
     order = [probe_corrupt_json, probe_not_a_zip, probe_bom, probe_missing_conversations_file,
              probe_doc_safe_name_collision, probe_doc_truncation_collision,
-             probe_doc_same_name_diff_content, probe_conv_title_collision,
+             probe_doc_same_name_diff_content, probe_rerun_into_same_dir,
+             probe_conv_title_collision,
              probe_windows_reserved_names, probe_lone_surrogate,
              probe_tool_result_string_content, probe_dict_content_block,
              probe_attachment_shadows_doc, probe_short_name_false_positives,
