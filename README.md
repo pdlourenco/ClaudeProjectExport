@@ -197,6 +197,22 @@ says how it was built once you've forgotten which flags you ran:
 it's in `.gitignore` and shouldn't be committed anywhere. It's plain, pretty-printed JSON,
 so you can hand-edit it if a project was renamed or deleted.
 
+#### What `exact` does and doesn't promise
+
+`exact` means every conversation in that project came from the mapping rather than a guess. It
+does **not** promise the project is complete. The mapping records what claude.ai returned at the
+moment you fetched it, and your export can contain conversations it didn't:
+
+- a conversation deleted from the project in the web app, which the fetch no longer sees but
+  the export may still carry
+- a conversation you started after fetching the mapping
+
+Neither is guessed back into the project — keyword matching never runs for a covered project, so
+`exact` stays exact and no project ever mixes joined and guessed conversations. Those
+conversations surface in the unfiled count instead, where you can see them. If one of them
+really does belong to a project, add it to `mapping.json` by hand and re-run; that's what the
+file is pretty-printed for. Re-fetching is the cure for the second case.
+
 ### Keyword matching (fallback)
 
 Without `--mapping`, the tool behaves exactly as it always has: it matches conversations using

@@ -306,6 +306,12 @@ def build_project_index(projects, conversations, mapping=None, allow_fuzzy=True)
       "exact" — joined by UUID through a mapping file (see load_mapping)
       "fuzzy" — keyword similarity between the project name and conversation titles
       "none"  — the mapping does not cover this project and fuzzy matching is off
+
+    "exact" means none of the project's conversations were guessed at. It does not mean the
+    project is complete: a conversation deleted from the project server-side, or started after
+    the mapping was fetched, is in the export but not in the mapping. Keyword matching is not
+    used to fill those gaps — a covered project never falls back — so no project mixes joined
+    and guessed conversations. Such conversations end up unfiled, where they are visible.
     """
     # Build keyword-to-conversation mapping
     conv_name_index = []
@@ -832,6 +838,10 @@ def main():
         print("ERROR: --unfiled requires --mapping — without an exact join there is no way to "
               "tell which conversations are unfiled.", file=sys.stderr)
         sys.exit(1)
+
+    if args.fuzzy and not args.mapping:
+        print("NOTE: --fuzzy has no effect without --mapping; keyword matching is already the "
+              "default.", file=sys.stderr)
 
     mapping = None
     if args.mapping:

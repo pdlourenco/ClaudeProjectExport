@@ -135,6 +135,10 @@ def main():
         check("strategy key absent without --mapping",
               all("strategy" not in e for e in plain))
 
+        proc = run(EXTRACTOR, zip_path, "--fuzzy", "--json")
+        check("--fuzzy without --mapping says it does nothing",
+              "NOTE: --fuzzy has no effect without --mapping" in proc.stderr)
+
         # ── Lean projects ────────────────────────────────────────────────────
         print("\nLean projects")
         check("metadata-only project reports 0 docs without error",
