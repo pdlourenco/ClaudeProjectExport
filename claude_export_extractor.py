@@ -83,22 +83,56 @@ def detect_extension(content: str, filename: str = "") -> str:
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def load_export(zip_path: Path):
-    """Load projects and conversations from the export ZIP."""
+    """Load projects and conversations from the export ZIP.
+
+    Exports come in two layouts. Older ones ship a single projects.json holding every
+    project. Current ones ship one file per project, under projects/<uuid>.json. Reading
+    only the first file whose name matches drops every project but one — silently, since
+    a one-project export is perfectly plausible — so every match is read and merged.
+    """
     with zipfile.ZipFile(zip_path, "r") as zf:
         names = zf.namelist()
 
-        proj_file = next((n for n in names if "project" in n.lower() and n.endswith(".json")), None)
+        proj_files = sorted(n for n in names if "project" in n.lower() and n.endswith(".json"))
         conv_file = next((n for n in names if "conversation" in n.lower() and n.endswith(".json")), None)
 
-        projects = json.loads(zf.read(proj_file)) if proj_file else []
+        projects = []
+        for proj_file in proj_files:
+            projects.extend(_as_projects(json.loads(zf.read(proj_file))))
+
         conversations = json.loads(zf.read(conv_file)) if conv_file else []
 
-    if isinstance(projects, dict):
-        projects = projects.get("projects", [projects])
     if isinstance(conversations, dict):
         conversations = conversations.get("conversations", conversations.get("data", []))
 
-    return projects, conversations
+    # An archive could carry both layouts; keep the first record for each UUID.
+    seen = set()
+    unique_projects = []
+    for proj in projects:
+        uuid = proj.get("uuid")
+        if uuid:
+            if uuid in seen:
+                continue
+            seen.add(uuid)
+        unique_projects.append(proj)
+
+    return unique_projects, conversations
+
+
+def _as_projects(blob):
+    """Normalise one project file's contents to a list of project records.
+
+    Handles all three shapes seen in the wild: a bare list of projects, a wrapper object
+    with a "projects" list, and a single project object in its own file.
+    """
+    if isinstance(blob, list):
+        return [p for p in blob if isinstance(p, dict)]
+    if isinstance(blob, dict):
+        nested = blob.get("projects")
+        if isinstance(nested, list):
+            return [p for p in nested if isinstance(p, dict)]
+        return [blob]
+    return []
 
 
 def build_project_index(projects, conversations):

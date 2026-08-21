@@ -38,14 +38,18 @@ That's it. No `pip install`, no virtual environment, no config file.
 3. Click **Settings**
 4. Under the **Account** section, click **Export Data**
 5. Claude sends you an email with a download link (usually arrives within a few minutes)
-6. Download the ZIP file — it contains four JSON files:
+6. Download the ZIP file. What's inside depends on when the export was produced:
 
 | File | Contents |
 |------|----------|
 | `conversations.json` | All your chat history (every conversation you've had) |
-| `projects.json` | Your projects with knowledge docs and prompt templates |
+| `projects/<uuid>.json` | One file per project — knowledge docs and prompt template |
+| `projects.json` | Older exports instead ship a single file holding every project |
 | `memories.json` | Saved memories |
 | `users.json` | Account info |
+| `login_history.json` | Sign-in history (not used by this tool) |
+
+Both project layouts are read, so it doesn't matter which one your export uses.
 
 ## Usage
 
