@@ -324,6 +324,15 @@ def build_project_index(projects, conversations, mapping=None, allow_fuzzy=True)
                 by_project[entry["project_uuid"]].append(conv)
         covered = set(mapping["projects"]) or set(by_project)
 
+    # Keyword matching draws only from conversations the mapping leaves unfiled. The mapping
+    # is authoritative: an uncovered project has no business guessing at a conversation that
+    # is known to belong somewhere else. This also keeps the exact and guessed sets disjoint,
+    # so every conversation is filed, guessed, or unfiled — never two of the three.
+    fuzzy_pool = conv_name_index
+    if mapping:
+        fuzzy_pool = [row for row in conv_name_index
+                      if row[2].get("uuid") not in mapping["conversations"]]
+
     index = []
     for proj in projects:
         name = proj.get("name") or proj.get("title") or "Untitled"
@@ -353,7 +362,7 @@ def build_project_index(projects, conversations, mapping=None, allow_fuzzy=True)
         if mapping and uuid in covered:
             matched_convos, strategy = by_project.get(uuid, []), "exact"
         elif allow_fuzzy:
-            matched_convos, strategy = _keyword_match(name, conv_name_index), "fuzzy"
+            matched_convos, strategy = _keyword_match(name, fuzzy_pool), "fuzzy"
         else:
             matched_convos, strategy = [], "none"
 
@@ -399,8 +408,13 @@ def _project_keywords(project_name: str) -> list:
 
 # ── Extraction ────────────────────────────────────────────────────────────────
 
-def extract_project(entry, output_dir: Path):
-    """Extract a single project's docs and conversations to the output directory."""
+def extract_project(entry, output_dir: Path, record_strategy: bool = False):
+    """Extract a single project's docs and conversations to the output directory.
+
+    record_strategy notes in the saved metadata how the conversations were matched. It is
+    only meaningful when a mapping was supplied; without one every project is matched the
+    same way and the field would say nothing.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     docs_dir = output_dir / "project_knowledge"
@@ -419,6 +433,9 @@ def extract_project(entry, output_dir: Path):
         "doc_count": entry["doc_count"],
         "conversation_count": entry["conv_count"],
     }
+    if record_strategy:
+        # "exact" — joined by UUID; "fuzzy" — guessed from the project name; "none" — not matched
+        meta["conversation_match"] = entry["strategy"]
     (docs_dir / "_project_metadata.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
@@ -522,23 +539,45 @@ def write_conversation(conv, conv_dir: Path, attach_dir: Path) -> int:
     return len(messages)
 
 
-def unfiled_conversations(mapping, projects, conversations):
-    """Return conversations the mapping files under no project present in the export.
+def _conv_key(conv):
+    """Identity for a conversation. Falls back to object identity if the export omits a UUID."""
+    return conv.get("uuid") or id(conv)
 
-    Two different situations land here and the export cannot tell them apart: a chat that
-    never belonged to a project, and a chat from a project that has since been deleted.
-    Both are equally unfiled as far as this tool can know, so both go to the same place.
 
-    Requires a mapping — keyword matching lets one conversation match several projects,
-    so there is no coherent notion of "unfiled" without an exact join.
+def unfiled_conversations(index, conversations):
+    """Return conversations that no project claimed, by any strategy.
+
+    A conversation a project guessed at is not unfiled — it already has a home, however
+    tentative, and writing it to both places would double-count it. What is left over is
+    genuinely unaccounted for, which can mean any of:
+
+      * a standalone chat that never belonged to a project
+      * a chat from a project deleted since, so the mapping points at a project the export
+        does not contain
+      * a chat created after the mapping was fetched
+
+    The export does not distinguish these, so neither does this function.
+
+    Requires a mapping — keyword matching alone lets one conversation match several projects
+    and leaves most of them matched by nothing, so "unfiled" carries no information without
+    an exact join to measure against.
     """
-    project_uuids = {proj.get("uuid", "") for proj in projects}
-    unfiled = []
-    for conv in conversations:
-        entry = mapping["conversations"].get(conv.get("uuid"))
-        if not entry or entry["project_uuid"] not in project_uuids:
-            unfiled.append(conv)
-    return unfiled
+    claimed = {_conv_key(conv) for entry in index for conv in entry["matched_conversations"]}
+    return [conv for conv in conversations if _conv_key(conv) not in claimed]
+
+
+def strategy_counts(index):
+    """Count distinct conversations claimed by each strategy.
+
+    Distinct, because two uncovered projects can guess at the same conversation. The exact
+    and fuzzy sets never overlap — see the fuzzy_pool note in build_project_index — so these
+    counts plus the unfiled count add up to the export's conversation total.
+    """
+    return {
+        name: len({_conv_key(conv) for entry in index if entry["strategy"] == name
+                   for conv in entry["matched_conversations"]})
+        for name in ("exact", "fuzzy")
+    }
 
 
 def extract_unfiled(conversations, output_dir: Path):
@@ -682,10 +721,10 @@ def assert_distinct_dirs(plan):
         by_dir[resolved] = entry
 
 
-def extract_or_exit(entry, out_dir: Path):
+def extract_or_exit(entry, out_dir: Path, record_strategy: bool = False):
     """Extract one project, turning filesystem refusals into a one-line error."""
     try:
-        return extract_project(entry, out_dir)
+        return extract_project(entry, out_dir, record_strategy)
     except OSError as exc:
         print(f"ERROR: Cannot write to {out_dir}: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -745,7 +784,7 @@ def interactive_mode(index, show_strategy: bool = False):
     # Extract
     for entry, out_dir in extractions:
         print(f"\nExtracting: {entry['name']} -> {out_dir}")
-        stats = extract_or_exit(entry, out_dir)
+        stats = extract_or_exit(entry, out_dir, show_strategy)
         print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
         print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
@@ -834,9 +873,10 @@ def main():
 
     unfiled = []
     if mapping:
-        unfiled = unfiled_conversations(mapping, projects, conversations)
-        print(f"Mapping: {len(conversations) - len(unfiled)} conversations filed under a project, "
-              f"{len(unfiled)} unfiled",
+        unfiled = unfiled_conversations(index, conversations)
+        counts = strategy_counts(index)
+        print(f"Mapping: {counts['exact']} conversations filed by UUID, "
+              f"{counts['fuzzy']} guessed by keyword, {len(unfiled)} unfiled",
               file=sys.stderr if args.json else sys.stdout)
 
     # JSON mode — machine-readable output for Claude Code
@@ -878,7 +918,7 @@ def main():
 
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
-            stats = extract_or_exit(entry, out_dir)
+            stats = extract_or_exit(entry, out_dir, mapping is not None)
             print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
             print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 

@@ -124,6 +124,7 @@ Each extracted project creates this organized layout:
 <output_dir>/
 ├── project_knowledge/
 │   ├── _project_metadata.json    # Project name, UUID, dates, doc/conversation counts
+│   │                             #   (plus how conversations were matched, with --mapping)
 │   ├── _prompt_template.md       # Project custom instructions (if the project had one)
 │   ├── research-paper.pdf        # Knowledge docs you uploaded to the project
 │   ├── api-spec.yaml             #   (identical copies deduplicated; same name but
@@ -173,7 +174,9 @@ does exactly that and saves the result as `mapping.json`; the extractor then joi
 python claude_export_extractor.py export.zip --mapping mapping.json
 ```
 
-Each project now reports how its conversations were matched:
+Each project reports how its conversations were matched — and the same answer is written into
+that project's `_project_metadata.json` as `"conversation_match"`, so the extracted folder still
+says how it was built once you've forgotten which flags you ran:
 
 ```
   #  Project Name                                         Docs  Convos   Match      Size     Created
@@ -221,19 +224,31 @@ reports the reconciliation:
 
 ```
 Found 88 projects, 950 conversations
-Mapping: 731 conversations filed under a project, 219 unfiled
+Mapping: 731 conversations filed by UUID, 12 guessed by keyword, 207 unfiled
 ```
 
-`--unfiled DIR` writes those 219 out. Be aware of what "unfiled" can mean: a conversation
-missing from the mapping is **either** a standalone chat that never belonged to a project
-**or** a chat from a project you have since deleted. Nothing in the export distinguishes the
-two, so the tool doesn't pretend to — both land in the same bucket. A conversation you started
-after fetching the mapping will also look unfiled; re-fetch if that matters.
+Those three numbers always add up to the total, because every conversation is filed, guessed,
+or unfiled — never two of the three:
 
-`--unfiled` requires `--mapping`: keyword matching can attach one conversation to several
-projects at once, so without an exact join there's no coherent notion of unfiled. Note that
-under `--fuzzy` a conversation can appear *both* in a project it was guessed into and in the
-unfiled bucket — the guess and the mapping disagree, and you can see both answers.
+- A conversation the mapping files under a project in your export is **filed**.
+- A conversation the mapping knows nothing about, that an uncovered project keyword-matched
+  under `--fuzzy`, is **guessed**. It is not also written to the unfiled bucket — it has a
+  home, however tentative.
+- Everything else is **unfiled**, and `--unfiled DIR` writes it out.
+
+Keyword matching only ever draws from conversations the mapping leaves unfiled. If the mapping
+says a conversation belongs to project A, then project B cannot guess its way to it, even when
+B's name matches the title. The mapping wins; guesses only fill silence.
+
+Be aware of what "unfiled" can mean. A conversation nothing claimed is **any** of: a standalone
+chat that never belonged to a project; a chat from a project you have since deleted, so the
+mapping points at a project your export doesn't contain; or a chat you started after fetching
+the mapping. Nothing in the export distinguishes these, so the tool doesn't pretend to — they
+all land in the same bucket.
+
+`--unfiled` requires `--mapping`: keyword matching alone attaches one conversation to several
+projects and leaves most matched by nothing, so "unfiled" carries no information without an
+exact join to measure against.
 
 ## Use Cases
 

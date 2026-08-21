@@ -95,10 +95,10 @@ def main():
             check("interactive picker identical to main", base_picker.stdout == new_picker.stdout)
 
             base_dir, new_dir = tmp / "base_out", tmp / "new_out"
-            base_out = run(baseline, zip_path, "--extract", "1,2,3",
-                           "--output", ",".join(str(base_dir / f"p{i}") for i in (1, 2, 3)))
-            new_out = run(EXTRACTOR, zip_path, "--extract", "1,2,3",
-                          "--output", ",".join(str(new_dir / f"p{i}") for i in (1, 2, 3)))
+            base_out = run(baseline, zip_path, "--extract", "1,2,3,4",
+                           "--output", ",".join(str(base_dir / f"p{i}") for i in (1, 2, 3, 4)))
+            new_out = run(EXTRACTOR, zip_path, "--extract", "1,2,3,4",
+                          "--output", ",".join(str(new_dir / f"p{i}") for i in (1, 2, 3, 4)))
             check("extraction stdout identical to main",
                   normalise(base_out.stdout, base_dir) == normalise(new_out.stdout, new_dir))
             base_tree = {k: normalise(v, base_dir) for k, v in tree(base_dir).items()}
@@ -122,6 +122,12 @@ def main():
         fuzzy = {e["name"]: e for e in index_json(zip_path, "--mapping", mapping_path, "--fuzzy")}
         check("uncovered project falls back to fuzzy with --fuzzy",
               fuzzy["Zebra Analysis"]["strategy"] == "fuzzy" and fuzzy["Zebra Analysis"]["conv_count"] == 1)
+        check("fuzzy cannot steal a conversation the mapping files elsewhere",
+              fuzzy["Capstone Review"]["conv_count"] == 0,
+              "'Capstone Review' keyword-matches a conversation mapped to 'Marketing Course 2700'")
+        plain_capstone = next(e for e in index_json(zip_path) if e["name"] == "Capstone Review")
+        check("...but still matches it when there is no mapping to defer to",
+              plain_capstone["conv_count"] == 1)
         check("--fuzzy does not disturb covered projects",
               all(fuzzy[n]["strategy"] == "exact" for n in ("Marketing Course 2700", "Lean Metadata Project")))
 
@@ -136,26 +142,51 @@ def main():
 
         # ── Unfiled bucket ───────────────────────────────────────────────────
         print("\nUnfiled bucket")
-        uf_root = tmp / "uf"
-        proc = run(EXTRACTOR, zip_path, "--mapping", mapping_path,
-                   "--extract", "1,2,3",
-                   "--output", ",".join(str(uf_root / f"p{i}") for i in (1, 2, 3)),
-                   "--unfiled", uf_root / "_unfiled")
-        unfiled_files = sorted(p.name for p in (uf_root / "_unfiled").glob("*.md"))
-        check("unmapped conversations land in the unfiled bucket",
-              unfiled_files == ["Weeknight dinner ideas.md", "Zebra stripe measurements.md"],
-              ", ".join(unfiled_files))
-
         total = len(make_fixture.CONVERSATIONS)
-        filed = sum(len(list((uf_root / f"p{i}" / "conversations").glob("*.md"))) for i in (1, 2, 3))
-        check("counts reconcile: filed + unfiled = total",
-              filed + len(unfiled_files) == total, f"{filed} filed + {len(unfiled_files)} unfiled = {total}")
-        check("reconciliation is reported on stdout",
-              "4 conversations filed under a project, 2 unfiled" in proc.stdout,
+
+        def extract_all(label, *extra):
+            root = tmp / label
+            proc = run(EXTRACTOR, zip_path, "--mapping", mapping_path, *extra,
+                       "--extract", "1,2,3,4",
+                       "--output", ",".join(str(root / f"p{i}") for i in (1, 2, 3, 4)),
+                       "--unfiled", root / "_unfiled")
+            bucket = sorted(f.name for f in (root / "_unfiled").glob("*.md"))
+            claimed = {f.name for i in (1, 2, 3, 4)
+                       for f in (root / f"p{i}" / "conversations").glob("*.md")}
+            return root, proc, bucket, claimed
+
+        root, proc, bucket, claimed = extract_all("uf_exact")
+        check("unmapped conversations land in the unfiled bucket",
+              bucket == ["Weeknight dinner ideas.md", "Zebra stripe measurements.md"],
+              ", ".join(bucket))
+        check("counts reconcile without --fuzzy: 4 + 0 + 2 = 6",
+              "4 conversations filed by UUID, 0 guessed by keyword, 2 unfiled" in proc.stdout,
               [l for l in proc.stdout.splitlines() if "unfiled" in l][:1])
+        check("exact + guessed + unfiled = total (no --fuzzy)", len(claimed) + len(bucket) == total)
+
+        root_f, proc_f, bucket_f, claimed_f = extract_all("uf_fuzzy", "--fuzzy")
+        check("a guessed conversation is NOT also written to the unfiled bucket",
+              "Zebra stripe measurements.md" in claimed_f and "Zebra stripe measurements.md" not in bucket_f,
+              f"unfiled now: {', '.join(bucket_f)}")
+        check("counts reconcile with --fuzzy: 4 + 1 + 1 = 6",
+              "4 conversations filed by UUID, 1 guessed by keyword, 1 unfiled" in proc_f.stdout,
+              [l for l in proc_f.stdout.splitlines() if "unfiled" in l][:1])
+        check("exact + guessed + unfiled = total (with --fuzzy)",
+              len(claimed_f) + len(bucket_f) == total, f"{len(claimed_f)} + {len(bucket_f)} = {total}")
 
         run(EXTRACTOR, zip_path, "--unfiled", tmp / "never", expect_rc=1)
         check("--unfiled without --mapping is a clean error", not (tmp / "never").exists())
+
+        # ── Provenance recorded in the extracted output ──────────────────────
+        print("\nProvenance in extracted output")
+        meta = json.loads((root_f / "p3" / "project_knowledge" / "_project_metadata.json")
+                          .read_text(encoding="utf-8"))
+        check("guessed project is marked in its saved metadata",
+              meta.get("conversation_match") == "fuzzy", f"conversation_match={meta.get('conversation_match')!r}")
+        meta_exact = json.loads((root_f / "p1" / "project_knowledge" / "_project_metadata.json")
+                                .read_text(encoding="utf-8"))
+        check("exactly-joined project is marked too",
+              meta_exact.get("conversation_match") == "exact")
 
         # ── Error handling ───────────────────────────────────────────────────
         print("\nError handling")

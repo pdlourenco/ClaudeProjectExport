@@ -19,6 +19,8 @@ The fixture deliberately contains the awkward cases:
   * a conversation that shares no vocabulary with its project name (keyword matching
     misses it; the mapping finds it)
   * a project absent from the mapping (exercises the fuzzy / none fallback)
+  * a second uncovered project whose name keyword-matches a conversation the mapping
+    already files under a *different* project — the mapping must win
   * a standalone conversation in no project at all (exercises _unfiled)
   * message content in both string and content-block form, plus an attachment
 """
@@ -31,6 +33,8 @@ from pathlib import Path
 P1 = "11111111-1111-4111-8111-111111111111"   # Marketing Course 2700  (mapped)
 P2 = "22222222-2222-4222-8222-222222222222"   # Lean Metadata Project  (mapped, no docs)
 P3 = "33333333-3333-4333-8333-333333333333"   # Zebra Analysis         (NOT mapped)
+P4 = "44444444-4444-4444-8444-444444444444"   # Capstone Review        (NOT mapped, would
+                                              #   keyword-steal C3 from P1 if allowed to)
 
 C1 = "aaaaaaaa-0001-4000-8000-000000000001"   # -> P1, title matches keywords
 C2 = "aaaaaaaa-0002-4000-8000-000000000002"   # -> P1, title matches keywords
@@ -108,6 +112,15 @@ PROJECTS = [
                 "created_at": "2026-03-20T14:35:00Z",
             },
         ],
+    },
+    {
+        "uuid": P4,
+        "name": "Capstone Review",
+        "description": "Uncovered, and its keywords collide with a conversation owned by P1.",
+        "created_at": "2026-02-10T10:00:00Z",
+        "updated_at": "2026-02-11T10:00:00Z",
+        "prompt_template": "",
+        "docs": [],
     },
 ]
 
