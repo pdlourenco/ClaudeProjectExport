@@ -114,7 +114,8 @@ Each extracted project creates this organized layout:
 │   ├── _project_metadata.json    # Project name, UUID, dates, doc/conversation counts
 │   ├── _prompt_template.md       # Project custom instructions (if the project had one)
 │   ├── research-paper.pdf        # Knowledge docs you uploaded to the project
-│   ├── api-spec.yaml             #   (deduplicated — no duplicates)
+│   ├── api-spec.yaml             #   (identical copies deduplicated; same name but
+│   │                             #    different content is kept as api-spec_1.yaml)
 │   └── notes.md                  #   (original filenames preserved)
 └── conversations/
     ├── Building the API client.md         # Related conversations as readable markdown
@@ -166,6 +167,14 @@ Claude.ai's export format doesn't include a project-to-conversation link. The to
 ### Can I extract conversations that aren't in any project?
 
 Currently the tool focuses on project-based extraction. For a full dump of all conversations, use the export ZIP directly — `conversations.json` contains everything.
+
+### Does the output include Claude's thinking?
+
+No. Conversations in recent exports contain `thinking` blocks alongside the reply text, and
+this tool extracts only the reply. On one real export that was 3.3 million characters of
+thinking left out, against 4.2 million characters of text kept — so if you are archiving a
+project for the reasoning rather than the answers, be aware that most of the reasoning is not
+in the output.
 
 ### Does this work with Claude.ai Team/Enterprise exports?
 
