@@ -163,10 +163,20 @@ does exactly that and saves the result as `mapping.json`; the extractor then joi
 
 **Step 1 — fetch the mapping**
 
-1. Sign in at [claude.ai](https://claude.ai)
-2. Open DevTools (`F12`, or `Cmd-Opt-I` on macOS) and go to the **Console** tab
-3. Paste the entire contents of [`fetch_mapping.js`](fetch_mapping.js) and press Enter
-4. Wait for it to finish — `mapping.json` downloads automatically
+1. **Request your data export first** (Settings → Account → Export Data), then do the rest
+   while you wait for the email. Order matters: the export is a snapshot taken when you
+   request it, so fetching the mapping *afterwards* guarantees it covers everything the
+   export contains. Fetch first and anything you chat about in between looks unmapped.
+2. Sign in at [claude.ai](https://claude.ai)
+3. Open DevTools (`F12`, or `Cmd-Opt-I` on macOS) and go to the **Console** tab
+4. Paste the entire contents of [`fetch_mapping.js`](fetch_mapping.js) and press Enter
+5. Wait for it to finish — `mapping.json` downloads automatically
+
+The script prints how many conversations it found per project. Spot-check a couple against
+the web app before relying on it: a project short a page still reports `exact` downstream,
+with full confidence. If something goes wrong it reports every endpoint it tried and what
+came back; setting `PROBE_ONLY = true` at the top runs just that diagnostic without
+fetching anything.
 
 **Step 2 — extract using it**
 
