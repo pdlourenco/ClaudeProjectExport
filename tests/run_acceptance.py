@@ -23,12 +23,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EXTRACTOR = ROOT / "claude_export_extractor.py"
-# The backwards-compatibility claim is "no --mapping behaves exactly as it did before this
-# feature", so the baseline is the commit this work sits on — the export-loading fix — not
-# main. Both give the same answer on the fixture's legacy layout, but only the first is right
-# in principle, and it stays right if the fixture ever moves to the per-project layout.
-BASELINE_REFS = ("claude/fix-silent-data-loss-and-crashes",
-                 "claude/load-all-projects-from-export", "main")
+# The backwards-compatibility claim is "no --mapping behaves exactly as it did before the
+# mapping feature", so the baseline is pinned to the commit immediately before it: main at
+# the point the export-loading and data-loss fixes had landed and nothing else. A branch name
+# would stop meaning that the moment this work merges — the check would compare the extractor
+# against itself and pass for free. Branch names remain as fallbacks for a shallow clone that
+# lacks the commit.
+BASELINE_REFS = ("2a3d93947ac3593396b5624e427628257319b925",
+                 "claude/fix-silent-data-loss-and-crashes", "main")
 
 STDLIB_ALLOWED = {"zipfile", "json", "re", "sys", "argparse", "pathlib", "datetime", "collections"}
 
