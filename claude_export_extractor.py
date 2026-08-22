@@ -34,7 +34,9 @@ from collections import defaultdict
 
 def safe_name(name: str, max_len: int = 80) -> str:
     """Sanitize a string for use as a filename."""
-    name = re.sub(r'[\\/*?:"<>|\x00-\x1f]', "_", name)
+    # The surrogate range is here for the same reason as the control characters: JSON
+    # permits lone surrogates, and a filename holding one cannot be encoded to disk.
+    name = re.sub(r'[\\/*?:"<>|\x00-\x1f\ud800-\udfff]', "_", name)
     name = re.sub(r"_+", "_", name)
     name = re.sub(r"\s+", " ", name).strip().strip("_. ")
     return name[:max_len] or "untitled"
@@ -78,6 +80,44 @@ def detect_extension(content: str, filename: str = "") -> str:
     if stripped.startswith("def ") or stripped.startswith("import ") or stripped.startswith("class "):
         return ".py"
     return ".txt"
+
+
+class NameAllocator:
+    """Hands out write paths within one directory, disambiguating collisions as name_1.ext.
+
+    Sanitizing and truncating filenames makes distinct source names collide (a/b.txt and
+    a\\b.txt both sanitize to a_b.txt; two names differing past character 80 both truncate
+    to the same thing), so writing blind loses documents silently.
+
+    A name handed out earlier in this run is never handed out again. A file left over from
+    an *earlier* run is overwritten, so re-extracting into the same directory refreshes it
+    in place rather than accumulating a copy of every document per run. Names the caller
+    reserves up front — the metadata and prompt files — are treated as already taken.
+
+    Each name resumes from its own counter, so a directory full of identically-named files
+    costs one step apiece instead of rescanning from _1 every time.
+    """
+
+    def __init__(self, directory: Path, reserved=()):
+        self.directory = directory
+        self.counters = {}
+        self.allocated = set(reserved)
+
+    def allocate(self, filename: str) -> Path:
+        stem, dot, ext = filename.rpartition(".")
+        if dot:
+            ext = "." + ext
+        else:
+            stem, ext = filename, ""
+
+        counter = self.counters.get(filename, 0)
+        while True:
+            candidate = filename if counter == 0 else f"{stem}_{counter}{ext}"
+            counter += 1
+            if candidate not in self.allocated:
+                self.counters[filename] = counter
+                self.allocated.add(candidate)
+                return self.directory / candidate
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -153,13 +193,17 @@ def build_project_index(projects, conversations):
         prompt = proj.get("prompt_template", "")
         docs = proj.get("docs") or []
 
-        # Deduplicate docs by filename
+        # Deduplicate docs by filename *and* content. Two docs sharing a name but holding
+        # different text are different documents; keying on the name alone discards one.
         seen = set()
         unique_docs = []
         for d in docs:
-            fname = d.get("filename", "untitled")
-            if fname not in seen and d.get("content"):
-                seen.add(fname)
+            content = d.get("content")
+            if not content:
+                continue
+            key = (d.get("filename", "untitled"), content)
+            if key not in seen:
+                seen.add(key)
                 unique_docs.append(d)
 
         # Count total content size
@@ -230,10 +274,15 @@ def extract_project(entry, output_dir: Path):
     # ── Save prompt template ─────────────────────────────────────────────
     if entry["prompt_template"]:
         (docs_dir / "_prompt_template.md").write_text(
-            entry["prompt_template"], encoding="utf-8"
+            entry["prompt_template"], encoding="utf-8", errors="backslashreplace"
         )
 
     # ── Extract knowledge docs ───────────────────────────────────────────
+    # The metadata and prompt files were written above, and the allocator overwrites files
+    # it did not hand out. safe_name strips leading underscores, so nothing can currently
+    # sanitize onto those names — reserving them keeps that from silently ceasing to be
+    # true if safe_name changes.
+    docs = NameAllocator(docs_dir, reserved=("_project_metadata.json", "_prompt_template.md"))
     for doc in entry["docs"]:
         filename = doc.get("filename", "untitled")
         content = doc.get("content", "")
@@ -241,14 +290,15 @@ def extract_project(entry, output_dir: Path):
             continue
 
         ext = detect_extension(content, filename)
-        safe = safe_name(filename) + ext
-        (docs_dir / safe).write_text(content, encoding="utf-8")
+        out_path = docs.allocate(safe_name(filename) + ext)
+        out_path.write_text(content, encoding="utf-8", errors="backslashreplace")
         stats["docs"] += 1
         stats["docs_kb"] += len(content) / 1024
 
     # ── Extract conversations ────────────────────────────────────────────
     if entry["matched_conversations"]:
         conv_dir.mkdir(exist_ok=True)
+        conv_names = NameAllocator(conv_dir)
 
         for conv in entry["matched_conversations"]:
             title = conv.get("name") or "Untitled"
@@ -285,7 +335,8 @@ def extract_project(entry, output_dir: Path):
                         att_safe = safe_name(fname) + att_ext
                         att_path = docs_dir / att_safe
                         if not att_path.exists():
-                            att_path.write_text(att_content, encoding="utf-8")
+                            att_path.write_text(att_content, encoding="utf-8",
+                                                errors="backslashreplace")
 
                 lines.append(f"### {role}  _{msg_ts}_\n")
                 if content:
@@ -297,14 +348,9 @@ def extract_project(entry, output_dir: Path):
                     lines.append("")
                 lines.append("---\n")
 
-            fname = safe_name(title) + ".md"
-            out_path = conv_dir / fname
-            counter = 1
-            while out_path.exists():
-                out_path = conv_dir / (safe_name(title) + f"_{counter}.md")
-                counter += 1
-
-            out_path.write_text("\n".join(lines), encoding="utf-8")
+            out_path = conv_names.allocate(safe_name(title) + ".md")
+            out_path.write_text("\n".join(lines), encoding="utf-8",
+                                errors="backslashreplace")
             stats["conversations"] += 1
             stats["convs_msgs"] += len(messages)
 
@@ -318,6 +364,11 @@ def _extract_message_content(msg) -> str:
     if isinstance(raw, str):
         return raw
 
+    # A single content block, unwrapped. Treat it as a one-element list rather than
+    # falling through every branch and returning nothing.
+    if isinstance(raw, dict):
+        raw = [raw]
+
     if isinstance(raw, list):
         parts = []
         for block in raw:
@@ -328,7 +379,15 @@ def _extract_message_content(msg) -> str:
                 if btype == "text":
                     parts.append(block.get("text", ""))
                 elif btype == "tool_result":
-                    for inner in block.get("content", []):
+                    inner_content = block.get("content", [])
+                    # Documented as a list of blocks, but a bare string is the shape a
+                    # simple tool returns; iterating that yields characters, not text.
+                    if isinstance(inner_content, str):
+                        parts.append(inner_content)
+                        inner_content = []
+                    elif isinstance(inner_content, dict):
+                        inner_content = [inner_content]
+                    for inner in inner_content:
                         if isinstance(inner, dict) and inner.get("type") == "text":
                             parts.append(inner.get("text", ""))
                 elif btype == "tool_use":
@@ -374,13 +433,62 @@ def print_json_index(index):
 
 # ── Interactive mode ──────────────────────────────────────────────────────────
 
+def prompt(message: str) -> str:
+    """input() that treats end-of-input or Ctrl-C as a cancellation, not a traceback.
+
+    Interactive mode is reachable by accident — a piped invocation, a CI job, an empty
+    --extract — so reading from a closed stdin has to end the run politely.
+    """
+    try:
+        return input(message)
+    except (EOFError, KeyboardInterrupt):
+        print("\nCancelled.")
+        sys.exit(0)
+
+
+def default_output_dir(entry, counters: dict) -> Path:
+    """Default directory for a project, disambiguated when two projects share a name.
+
+    Project names are not unique — "Untitled", a re-created project, a renamed duplicate —
+    and deriving the directory from the name alone silently merges them into one folder.
+    """
+    base = safe_name(entry["name"])
+    counter = counters.get(base, 0)
+    counters[base] = counter + 1
+    return Path.cwd() / (base if counter == 0 else f"{base}_{counter + 1}")
+
+
+def assert_distinct_dirs(plan):
+    """Refuse to extract two different projects into the same directory."""
+    by_dir = {}
+    for entry, out_dir in plan:
+        resolved = Path(out_dir).expanduser().resolve()
+        clash = by_dir.get(resolved)
+        if clash is not None and clash["uuid"] != entry["uuid"]:
+            print(f"ERROR: '{clash['name']}' and '{entry['name']}' would both extract to "
+                  f"{resolved}. Give them separate output directories.", file=sys.stderr)
+            sys.exit(1)
+        by_dir[resolved] = entry
+
+
+def extract_or_exit(entry, out_dir: Path):
+    """Extract one project, turning filesystem refusals into a one-line error."""
+    try:
+        return extract_project(entry, out_dir)
+    except OSError as exc:
+        print(f"ERROR: Cannot write to {out_dir}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+
+
 def interactive_mode(index):
     """Run interactive project selection and extraction."""
     print_project_list(index)
 
     print("\nEnter project numbers to extract (comma-separated, e.g. '1,3,5')")
     print("Or 'all' to extract everything, or 'q' to quit:")
-    choice = input("> ").strip()
+    choice = prompt("> ").strip()
 
     if choice.lower() in ("q", "quit", "exit"):
         print("Cancelled.")
@@ -401,14 +509,16 @@ def interactive_mode(index):
 
     # Ask for output directories
     extractions = []
+    default_names = {}
     for idx in selected:
         entry = index[idx]
-        default_dir = Path.cwd() / safe_name(entry["name"])
+        default_dir = default_output_dir(entry, default_names)
         print(f"\nOutput directory for '{entry['name']}'?")
         print(f"  [Enter] for default: {default_dir}")
-        dir_input = input("  > ").strip()
+        dir_input = prompt("  > ").strip()
         out_dir = Path(dir_input) if dir_input else default_dir
         extractions.append((entry, out_dir))
+    assert_distinct_dirs(extractions)
 
     # Confirm
     print("\n── Extraction Plan ──")
@@ -417,7 +527,7 @@ def interactive_mode(index):
         print(f"    -> {out_dir}")
         print(f"    {entry['doc_count']} docs, {entry['conv_count']} conversations")
     print()
-    confirm = input("Proceed? [Y/n] ").strip()
+    confirm = prompt("Proceed? [Y/n] ").strip()
     if confirm.lower() in ("n", "no"):
         print("Cancelled.")
         return
@@ -425,7 +535,7 @@ def interactive_mode(index):
     # Extract
     for entry, out_dir in extractions:
         print(f"\nExtracting: {entry['name']} -> {out_dir}")
-        stats = extract_project(entry, out_dir)
+        stats = extract_or_exit(entry, out_dir)
         print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
         print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
@@ -446,6 +556,12 @@ def main():
     parser.add_argument("--output", type=str, default=None,
                         help="Comma-separated output directories (one per project)")
 
+    # A lone UTF-16 surrogate in a project or conversation name would otherwise abort the
+    # run on the first print, before anything is written. JSON allows them, so survive them.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
     args = parser.parse_args()
     zip_path = Path(args.zip_path)
 
@@ -454,7 +570,20 @@ def main():
         sys.exit(1)
 
     print(f"Loading: {zip_path}", file=sys.stderr if args.json else sys.stdout)
-    projects, conversations = load_export(zip_path)
+    try:
+        projects, conversations = load_export(zip_path)
+    except zipfile.BadZipFile:
+        print(f"ERROR: Not a ZIP file (or the download is corrupt): {zip_path}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        print(f"ERROR: The export contains invalid JSON ({zip_path}): {exc}", file=sys.stderr)
+        sys.exit(1)
+    except RecursionError:
+        print(f"ERROR: The export's JSON is nested too deeply to parse: {zip_path}", file=sys.stderr)
+        sys.exit(1)
+    except OSError as exc:
+        print(f"ERROR: Could not read {zip_path}: {exc}", file=sys.stderr)
+        sys.exit(1)
     index = build_project_index(projects, conversations)
     print(f"Found {len(index)} projects, {len(conversations)} conversations",
           file=sys.stderr if args.json else sys.stdout)
@@ -465,22 +594,40 @@ def main():
         return
 
     # Non-interactive mode — extract specified projects
-    if args.extract:
-        nums = [int(x.strip()) - 1 for x in args.extract.split(",")]
+    # `is not None`, so that --extract "" is an error rather than a silent fall-through
+    # into interactive mode, which then dies on a closed stdin.
+    if args.extract is not None:
+        if not args.extract.strip():
+            print("ERROR: --extract needs at least one project number", file=sys.stderr)
+            sys.exit(1)
+        try:
+            nums = [int(x.strip()) - 1 for x in args.extract.split(",")]
+        except ValueError:
+            print(f"ERROR: --extract takes comma-separated project numbers, got: "
+                  f"{args.extract!r}", file=sys.stderr)
+            sys.exit(1)
+
         dirs = args.output.split(",") if args.output else [None] * len(nums)
 
         if len(dirs) != len(nums):
             print("ERROR: --output must have the same number of paths as --extract", file=sys.stderr)
             sys.exit(1)
 
+        plan = []
+        default_names = {}
         for i, num in enumerate(nums):
             if num < 0 or num >= len(index):
                 print(f"ERROR: Invalid project number: {num+1}", file=sys.stderr)
                 sys.exit(1)
             entry = index[num]
-            out_dir = Path(dirs[i].strip()) if dirs[i] else Path.cwd() / safe_name(entry["name"])
+            out_dir = (Path(dirs[i].strip()) if dirs[i]
+                       else default_output_dir(entry, default_names))
+            plan.append((entry, out_dir))
+        assert_distinct_dirs(plan)
+
+        for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
-            stats = extract_project(entry, out_dir)
+            stats = extract_or_exit(entry, out_dir)
             print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
             print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
