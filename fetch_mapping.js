@@ -66,19 +66,24 @@
     ],
     // Strategy A: every conversation in one listing. If the objects carry a project
     // reference, the whole mapping comes from this one endpoint — no per-project paging.
-    allConversations: (org, cursor) => [
-      `/api/organizations/${org}/chat_conversations?limit=${PAGE_SIZE}` + cur(cursor),
-      `/api/organizations/${org}/conversations?limit=${PAGE_SIZE}` + cur(cursor),
+    allConversations: (org, cursor, offset) => [
+      `/api/organizations/${org}/chat_conversations?limit=${PAGE_SIZE}` + page(cursor, offset),
+      `/api/organizations/${org}/conversations?limit=${PAGE_SIZE}` + page(cursor, offset),
     ],
     // Strategy B: ask each project for its conversations. Used only if strategy A finds no
     // project reference on a conversation.
-    projectConversations: (org, project, cursor) => [
-      `/api/organizations/${org}/projects/${project}/conversations_v2?limit=${PAGE_SIZE}` + cur(cursor),
-      `/api/organizations/${org}/projects/${project}/conversations?limit=${PAGE_SIZE}` + cur(cursor),
+    projectConversations: (org, project, cursor, offset) => [
+      `/api/organizations/${org}/projects/${project}/conversations_v2?limit=${PAGE_SIZE}` + page(cursor, offset),
+      `/api/organizations/${org}/projects/${project}/conversations?limit=${PAGE_SIZE}` + page(cursor, offset),
     ],
   };
 
-  const cur = (c) => (c ? `&starting_after=${encodeURIComponent(c)}` : "");
+  // Cursor if the response gave us one, otherwise offset. A listing that answers with a bare
+  // array — no envelope, no cursor — is paged by offset or not at all.
+  const page = (cursor, offset) =>
+    cursor ? `&starting_after=${encodeURIComponent(cursor)}`
+      : offset ? `&offset=${offset}`
+        : "";
 
   // Keys a conversation might carry pointing at its project.
   const PROJECT_KEYS = ["project_uuid", "project_id", "projectUuid"];
@@ -131,38 +136,68 @@
       : Array.isArray(body?.projects) ? body.projects
       : [];
 
-  function nextCursor(body, page) {
+  function nextCursor(body) {
     if (!Array.isArray(body) && body?.has_more === false) return null;
-    const cursor = Array.isArray(body) ? null
-      : body?.last_id ?? body?.next_cursor ?? body?.cursor ?? null;
-    if (cursor) return cursor;
-    if (page.length >= PAGE_SIZE) {
-      const shape = Array.isArray(body)
-        ? "the response is a bare array, with no pagination envelope"
-        : `response keys: [${Object.keys(body || {}).join(", ")}]`;
-      console.warn(`  ! Full page of ${page.length} with no pagination cursor — ${shape}. ` +
-                   `Results may be truncated; check counts against the web UI.`);
-    }
-    return null;
+    if (Array.isArray(body)) return null;
+    return body?.last_id ?? body?.next_cursor ?? body?.cursor ?? null;
   }
 
-  /** Page through an endpoint until it stops giving cursors. */
+  /** Page through an endpoint until it stops returning anything new.
+   *
+   * Deliberately not "until a page looks short": an API that caps `limit` lower than we ask
+   * would make the very first page look like the last, which is how a listing silently comes
+   * back with only its first page. Paging until nothing new arrives costs one extra request
+   * and cannot be fooled that way. Deduplicating by uuid is what makes it safe — an endpoint
+   * that ignores `offset` returns page one forever, and that is detected as "nothing new"
+   * rather than looping.
+   */
   async function pageThrough(makePaths, label) {
     const items = [];
-    let cursor = null, pages = 0, path = null;
-    do {
-      const got = await firstWorking(makePaths(cursor));
+    const seen = new Set();
+    let cursor = null, chosen = -1, pages = 0, path = null, stalled = false;
+
+    while (true) {
+      const paths = makePaths(cursor, items.length);
+      let got = null;
+      if (chosen >= 0) {
+        // Stay on the candidate that answered the first page.
+        const body = await attempt(paths[chosen]);
+        if (body !== null) got = { body, path: paths[chosen] };
+      } else {
+        for (let i = 0; i < paths.length; i++) {
+          const body = await attempt(paths[i]);
+          if (body !== null) { got = { body, path: paths[i] }; chosen = i; break; }
+          await sleep(DELAY_MS);
+        }
+      }
       if (!got) return path ? { items, path } : null;
       path = got.path;
-      const page = asList(got.body);
-      items.push(...page);
-      cursor = page.length ? nextCursor(got.body, page) : null;
-      if (++pages >= MAX_PAGES && cursor) {
+
+      const batch = asList(got.body);
+      let fresh = 0;
+      for (const item of batch) {
+        const id = item?.uuid || item?.id;
+        if (id && seen.has(id)) continue;
+        if (id) seen.add(id);
+        items.push(item);
+        fresh += 1;
+      }
+
+      if (!batch.length) break;                 // exhausted
+      if (fresh === 0) { stalled = true; break; } // same page again: paging is not working
+      cursor = nextCursor(got.body);
+      if (++pages >= MAX_PAGES) {
         console.warn(`  ! Stopped at ${MAX_PAGES} pages for ${label}; raise MAX_PAGES.`);
         break;
       }
-      if (cursor) await sleep(DELAY_MS);
-    } while (cursor);
+      await sleep(DELAY_MS);
+    }
+
+    if (stalled && items.length >= PAGE_SIZE) {
+      console.warn(`  ! ${label}: the next page repeated the previous one, so this listing ` +
+                   `is probably capped at ${items.length}. Neither a cursor nor ?offset= ` +
+                   `advanced it — check the counts below against the web app.`);
+    }
     return { items, path };
   }
 
@@ -228,7 +263,7 @@
     }
 
     if (PROBE_ONLY) {
-      const probe = await firstWorking(CANDIDATES.allConversations(org, null));
+      const probe = await firstWorking(CANDIDATES.allConversations(org, null, 0));
       if (probe) {
         const sample = asList(probe.body)[0];
         console.log(`\nConversation listing: ${probe.path}`);
@@ -242,7 +277,7 @@
 
     // Strategy A — one listing, if conversations carry their project.
     let counts = {};
-    const all = await pageThrough((c) => CANDIDATES.allConversations(org, c), "all conversations");
+    const all = await pageThrough((c, o) => CANDIDATES.allConversations(org, c, o), "all conversations");
     const sample = all?.items?.find((c) => projectRef(c));
     if (sample) {
       console.log(`Listing all conversations via ${all.path} — they carry a project reference.`);
@@ -264,7 +299,7 @@
       for (const [i, project] of projects.entries()) {
         const uuid = project.uuid || project.id;
         const name = project.name || project.title || "Untitled";
-        const got = await pageThrough((c) => CANDIDATES.projectConversations(org, uuid, c), name);
+        const got = await pageThrough((c, o) => CANDIDATES.projectConversations(org, uuid, c, o), name);
         if (!got) {
           console.warn(`  ! No conversation endpoint answered for "${name}".`);
           continue;
