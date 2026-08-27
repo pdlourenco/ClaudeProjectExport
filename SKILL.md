@@ -59,7 +59,9 @@ Ask whether the user can open [claude.ai](https://claude.ai) in a signed-in brow
 **If yes**, walk them through it:
 
 1. Read `~/.claude/skills/ClaudeProjectExport/fetch_mapping.js` and give them its contents to
-   paste — they need the text, not a path they'd have to go find.
+   paste — they need the text, not a path they'd have to go find. If that file isn't there,
+   the install predates it: ask them to re-run the `cp` line from the repo's README, which now
+   copies it too.
 2. They open DevTools (`F12`, or `Cmd-Opt-I` on macOS) → **Console** on a claude.ai tab. On
    Firefox the first paste is blocked: they press `Ctrl+V`, type `allow pasting`, press Enter,
    then paste again.
@@ -88,7 +90,7 @@ also carries `strategy`:
 
 | `strategy` | meaning |
 |---|---|
-| `exact` | conversations joined by UUID — trustworthy |
+| `exact` | conversations joined by UUID — nothing guessed |
 | `fuzzy` | guessed from the project name; only appears if you passed `--fuzzy` |
 | `none` | the mapping doesn't cover this project, so nothing was attached |
 
