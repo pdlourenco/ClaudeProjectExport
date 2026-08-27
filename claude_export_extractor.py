@@ -1009,7 +1009,8 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
         print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
         print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
-    return True
+    # The first directory, so a caller wanting somewhere to put run-level files has one.
+    return extractions[0][1]
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1108,27 +1109,6 @@ def main():
     print(f"Found {len(index)} projects, {len(conversations)} conversations",
           file=sys.stderr if args.json else sys.stdout)
 
-    if args.faithful:
-        # Account-level files land once, in the unfiled bucket when there is one, otherwise
-        # beside the first project — they are not project data, so copying them into every
-        # output directory would be duplication rather than completeness.
-        account = load_account_files(zip_path)
-        if account:
-            destinations = [args.unfiled] if args.unfiled else []
-            if not destinations and args.output:
-                destinations = [args.output.split(",")[0].strip()]
-            if destinations:
-                target = Path(destinations[0]) / "raw" / "account"
-                target.mkdir(parents=True, exist_ok=True)
-                for name, blob in account.items():
-                    (target / name).write_bytes(blob)
-                print(f"Account files -> {target}: {', '.join(sorted(account))}",
-                      file=sys.stderr if args.json else sys.stdout)
-            else:
-                print(f"NOTE: {', '.join(sorted(account))} were not copied — give --output or "
-                      f"--unfiled a directory and they will be. They remain in the export ZIP.",
-                      file=sys.stderr)
-
     unfiled = []
     if mapping:
         unfiled = unfiled_conversations(index, conversations)
@@ -1174,6 +1154,11 @@ def main():
             plan.append((entry, out_dir))
         assert_distinct_dirs(plan)
 
+        if args.faithful:
+            # The unfiled bucket when there is one, otherwise the first project's directory,
+            # resolved default included. Account files are not project data, so one copy.
+            copy_account_files(zip_path, Path(args.unfiled) if args.unfiled else plan[0][1])
+
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
             stats = extract_or_exit(entry, out_dir, mapping is not None,
@@ -1186,11 +1171,33 @@ def main():
         return
 
     # Interactive mode
-    if interactive_mode(index, show_strategy=mapping is not None,
-                        include_thinking=args.thinking or args.faithful,
-                        faithful=args.faithful):
+    chosen = interactive_mode(index, show_strategy=mapping is not None,
+                              include_thinking=args.thinking or args.faithful,
+                              faithful=args.faithful)
+    if chosen:
+        if args.faithful:
+            copy_account_files(zip_path, Path(args.unfiled) if args.unfiled else chosen)
         _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
+
+
+def copy_account_files(zip_path: Path, destination: Path):
+    """Carry across the archive's account-level files, once.
+
+    Called only after an extraction plan resolves, so the destination is a directory that
+    is actually being written to — including a default one derived from a project name.
+    Doing it earlier meant a --json listing wrote files to disk, and a run using default
+    directories carried nothing at all, which are the two commonest ways to invoke this.
+    """
+    account = load_account_files(zip_path)
+    if not account:
+        return
+    target = Path(destination) / "raw" / "account"
+    target.mkdir(parents=True, exist_ok=True)
+    for name, blob in account.items():
+        (target / name).write_bytes(blob)
+    print(f"\nAccount files -> {target}")
+    print(f"  {', '.join(sorted(account))}")
 
 
 def _extract_unfiled(unfiled_dir, unfiled, include_thinking: bool = False,

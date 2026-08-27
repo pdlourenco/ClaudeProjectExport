@@ -49,9 +49,9 @@ def skip(name, detail):
     print(f"  [SKIP] {name} — {detail}")
 
 
-def run(script, *args, expect_rc=0):
+def run(script, *args, expect_rc=0, stdin="q\n"):
     proc = subprocess.run([sys.executable, str(script), *map(str, args)],
-                          capture_output=True, text=True, input="q\n")
+                          capture_output=True, text=True, input=stdin)
     if expect_rc is not None and proc.returncode != expect_rc:
         raise AssertionError(f"rc={proc.returncode} (wanted {expect_rc})\n{proc.stdout}\n{proc.stderr}")
     return proc
@@ -353,6 +353,32 @@ def main():
                               for f in (faith / "thinking").glob("*.md"))
         check("thinking summaries reach the reasoning files", "CONDENSED REASONING" in reasoning)
         check("--faithful implies --thinking", (faith / "thinking").exists())
+
+        # Account files have to reach a directory the run actually writes to, including a
+        # default one derived from the project name — the two commonest invocations.
+        defaults = tmp / "defaults"
+        defaults.mkdir()
+        proc = subprocess.run([sys.executable, str(EXTRACTOR), str(zip_path),
+                               "--faithful", "--extract", "1"],
+                              capture_output=True, text=True, input="q\n", cwd=defaults)
+        landed = list(defaults.rglob("raw/account/*.json"))
+        check("account files land when output directories are left to default",
+              bool(landed), f"{[f.name for f in landed] or 'nothing copied'}")
+
+        interactive = tmp / "interactive"
+        interactive.mkdir()
+        subprocess.run([sys.executable, str(EXTRACTOR), str(zip_path), "--faithful"],
+                       capture_output=True, text=True, input="1\n\ny\n", cwd=interactive)
+        check("account files land from an interactive run",
+              bool(list(interactive.rglob("raw/account/*.json"))))
+
+        # A listing is a read. It must not put anything on disk.
+        listing = tmp / "listing"
+        listing.mkdir()
+        run(EXTRACTOR, zip_path, "--faithful", "--json", "--mapping", mapping_path,
+            "--unfiled", listing / "dump")
+        check("a --json listing writes nothing, even with --faithful",
+              not list(listing.rglob("*")), f"{[str(f) for f in listing.rglob('*')][:3]}")
 
         plain2 = tmp / "not_faithful"
         run(EXTRACTOR, zip_path, "--extract", "1", "--output", plain2)
