@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -266,6 +267,53 @@ def main():
         stale_path.write_text(json.dumps(stale, indent=2), encoding="utf-8")
         proc = run(EXTRACTOR, zip_path, "--mapping", stale_path, "--json")
         check("stale mapping warns and continues", "WARNING:" in proc.stderr and proc.returncode == 0)
+
+        # ── Thinking ─────────────────────────────────────────────────────────
+        print("\nThinking")
+        plain_dir = tmp / "think_off"
+        run(EXTRACTOR, zip_path, "--extract", "1", "--output", plain_dir)
+        check("no thinking folder without --thinking", not (plain_dir / "thinking").exists())
+
+        think_dir = tmp / "think_on"
+        run(EXTRACTOR, zip_path, "--thinking", "--extract", "1", "--output", think_dir)
+        transcripts = sorted(f.name for f in (think_dir / "conversations").glob("*.md"))
+        reasoning = sorted(f.name for f in (think_dir / "thinking").glob("*.md"))
+        check("reasoning filenames are a subset of the transcript filenames",
+              set(reasoning) <= set(transcripts), f"{reasoning}")
+        written = "\n".join((think_dir / "thinking" / f).read_text(encoding="utf-8") for f in reasoning)
+        check("reasoning text is written", "REASONING ONE" in written and "REASONING TWO" in written)
+        check("a message's several blocks are all kept",
+              written.count("REASONING") >= 2)
+        check("transcripts still carry no reasoning",
+              "REASONING" not in "\n".join((think_dir / "conversations" / f).read_text(encoding="utf-8")
+                                           for f in transcripts))
+        check("a conversation whose only block is empty gets no file",
+              "Ideas for the final capstone brief.md" not in reasoning,
+              f"{len(reasoning)} of {len(transcripts)} transcripts have reasoning")
+
+        # Two conversations sharing a title are disambiguated once, by the allocator; the
+        # reasoning file has to inherit that answer rather than deriving a name of its own.
+        collide = tmp / "collide.zip"
+        think_block = {"type": "thinking", "thinking": "COLLIDING REASONING"}
+        with zipfile.ZipFile(collide, "w") as zf:
+            zf.writestr("projects.json", json.dumps([{
+                "uuid": "p-1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "description": "", "prompt_template": "", "docs": []}]))
+            zf.writestr("conversations.json", json.dumps([
+                # Same title on purpose: they collide on filename, and the title matches the
+                # project so keyword matching attaches them without needing a mapping here.
+                {"uuid": f"c{i}", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                 "updated_at": "2026-01-01T00:00:00Z",
+                 "chat_messages": [{"uuid": f"m{i}", "sender": "assistant",
+                                    "created_at": "2026-01-01T00:00:00Z",
+                                    "content": [think_block, {"type": "text", "text": "hi"}]}]}
+                for i in range(3)]))
+        collide_out = tmp / "collide_out"
+        run(EXTRACTOR, collide, "--thinking", "--extract", "1", "--output", collide_out)
+        ct = sorted(f.name for f in (collide_out / "conversations").glob("*.md"))
+        cr = sorted(f.name for f in (collide_out / "thinking").glob("*.md"))
+        check("colliding titles: reasoning filenames track the disambiguated transcripts",
+              ct == cr and len(ct) == 3, f"{ct} vs {cr}")
 
         # ── The browser script's paging ──────────────────────────────────────
         # fetch_mapping.js is the one piece of this repo that is not Python, and its paging is

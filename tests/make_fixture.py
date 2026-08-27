@@ -125,7 +125,7 @@ PROJECTS = [
 ]
 
 
-def _msg(uuid, sender, text, created_at, attachments=None, blocks=False):
+def _msg(uuid, sender, text, created_at, attachments=None, blocks=False, thinking=None):
     msg = {
         "uuid": uuid,
         "sender": sender,
@@ -139,6 +139,15 @@ def _msg(uuid, sender, text, created_at, attachments=None, blocks=False):
         msg["text"] = ""
     else:
         msg["content"] = text
+    if thinking is not None:
+        # Reasoning rides alongside the reply. `thinking` here is a list so a message can
+        # carry several blocks, and an empty one — which real exports contain by the
+        # hundred — to prove empties produce no section rather than an empty heading.
+        msg["content"] = ([msg["content"]] if isinstance(msg["content"], str)
+                          else list(msg["content"]))
+        msg["content"] = [b if isinstance(b, dict) else {"type": "text", "text": b}
+                          for b in msg["content"]]
+        msg["content"] = [{"type": "thinking", "thinking": t} for t in thinking] + msg["content"]
     return msg
 
 
@@ -151,7 +160,8 @@ CONVERSATIONS = [
         "chat_messages": [
             _msg("m1-1", "human", "Draft the week one lesson plan.", "2025-11-06T10:00:00Z"),
             _msg("m1-2", "assistant", "Here is a plan:\n\n1. Positioning\n2. Segmentation\n",
-                 "2025-11-06T10:01:00Z", blocks=True),
+                 "2025-11-06T10:01:00Z", blocks=True,
+                 thinking=["REASONING ONE: weigh positioning before segmentation.", ""]),
         ],
     },
     {
@@ -167,7 +177,8 @@ CONVERSATIONS = [
                      "extracted_content": "Clarity: 50 points. Evidence: 50 points. "
                                           "This attachment is long enough to be saved to disk.\n",
                  }]),
-            _msg("m2-2", "assistant", "Revised rubric attached below.", "2025-11-09T11:02:00Z"),
+            _msg("m2-2", "assistant", "Revised rubric attached below.", "2025-11-09T11:02:00Z",
+                 thinking=["REASONING TWO: tighten the evidence criterion."]),
         ],
     },
     {
@@ -180,7 +191,7 @@ CONVERSATIONS = [
         "chat_messages": [
             _msg("m3-1", "human", "Suggest three capstone briefs.", "2025-12-01T09:00:00Z"),
             _msg("m3-2", "assistant", "1. Local retailer repositioning\n2. Category entry\n3. Pricing test\n",
-                 "2025-12-01T09:01:00Z"),
+                 "2025-12-01T09:01:00Z", thinking=[""]),   # only an empty block: no file at all
         ],
     },
     {
