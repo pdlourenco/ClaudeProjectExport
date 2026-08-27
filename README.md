@@ -298,14 +298,14 @@ This tool also works as a [Claude Code](https://docs.anthropic.com/en/docs/claud
 
 ```bash
 mkdir -p ~/.claude/skills/ClaudeProjectExport
-cp claude_export_extractor.py SKILL.md ~/.claude/skills/ClaudeProjectExport/
+cp claude_export_extractor.py fetch_mapping.js SKILL.md ~/.claude/skills/ClaudeProjectExport/
 ```
 
 Then in Claude Code, type `/ClaudeProjectExport` and follow the prompts.
 
 ## Requirements
 
-- **Python 3.10+** (uses `match` statements and modern type hints)
+- **Python 3.10+** — the tested floor; it runs on older versions but nothing checks that
 - No external packages — stdlib only (`zipfile`, `json`, `argparse`, `pathlib`)
 - Works on **Windows**, **macOS**, and **Linux**
 
