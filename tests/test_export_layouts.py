@@ -25,7 +25,7 @@ EXTRACTOR = ROOT / "claude_export_extractor.py"
 
 PROJECTS = [
     {
-        "uuid": "019c85ae-f2b7-7777-8f5a-2b416ed16ce8",
+        "uuid": "a0000000-0000-4000-8000-000000000001",
         "name": "First Project",
         "description": "Has a knowledge doc.",
         "created_at": "2026-02-22T10:00:00Z",
@@ -37,7 +37,7 @@ PROJECTS = [
                   "content": "# Notes\n", "created_at": "2026-02-22T10:05:00Z"}],
     },
     {
-        "uuid": "019c874c-fc40-729b-abdb-342cf6268398",
+        "uuid": "a0000000-0000-4000-8000-000000000002",
         "name": "Second Project",
         "description": "",
         "created_at": "2026-03-01T10:00:00Z",
@@ -48,7 +48,7 @@ PROJECTS = [
         "docs": [],
     },
     {
-        "uuid": "019c8967-f21d-723c-8623-56bec3207569",
+        "uuid": "a0000000-0000-4000-8000-000000000003",
         "name": "Third Project",
         "description": "",
         "created_at": "2026-03-10T10:00:00Z",
