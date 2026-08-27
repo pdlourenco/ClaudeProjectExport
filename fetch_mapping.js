@@ -30,12 +30,31 @@
  * -------------------------------------
  * These are Claude.ai's *internal* web-app endpoints. They are undocumented, unversioned, and
  * covered by no compatibility promise: Anthropic may change or remove them at any time,
- * without notice. Nothing here is an official API. The paths below were transcribed from a
- * third-party userscript and have NOT been verified against a live session by this file's
- * author — which is why each one is a list of candidates that gets probed in order rather
- * than a single hardcoded guess.
+ * without notice. Nothing here is an official API — which is why each path below is a list of
+ * candidates, probed in order, rather than a single hardcoded guess.
  *
- *   Observed on <date> by <who>: <paste the real paths here once verified>
+ *   Observed 2026-08-27 by @pdlourenco, against a live signed-in session:
+ *
+ *     GET /api/organizations
+ *         -> array of organizations. This account had two; the first held every project.
+ *
+ *     GET /api/organizations/{org}/projects
+ *         -> array of {uuid, name, ...}. Returns only projects that still exist: one project
+ *            present in that week's data export was already absent here, having been deleted.
+ *
+ *     GET /api/organizations/{org}/chat_conversations?limit=N&offset=M
+ *         -> BARE ARRAY, no envelope and no cursor. Each conversation carries project_uuid
+ *            directly, which is what makes the single-listing strategy possible. Paged by
+ *            offset; asking for limit=100 and stopping at the first short page silently
+ *            truncated a real run to its first page.
+ *
+ *     GET /api/organizations/{org}/projects/{project}/conversations_v2?limit=N
+ *         -> {data, pagination} — note the envelope differs from the listing above. Returned
+ *            exactly the conversations belonging to that project. Its pagination fields were
+ *            not observed under load; every project here fitted in one page.
+ *
+ * Endpoints drift. Treat the date above as the expiry on all of this, and re-check with
+ * PROBE_ONLY before trusting a run that matters.
  *
  * WHAT IT DOES NOT DO
  * -------------------
@@ -137,9 +156,15 @@
       : [];
 
   function nextCursor(body) {
-    if (!Array.isArray(body) && body?.has_more === false) return null;
-    if (Array.isArray(body)) return null;
-    return body?.last_id ?? body?.next_cursor ?? body?.cursor ?? null;
+    if (Array.isArray(body)) return null;   // bare array: nothing to read, offset paging only
+    // conversations_v2 answers {data, pagination}; other listings put these at the top level.
+    for (const envelope of [body?.pagination, body]) {
+      if (!envelope || typeof envelope !== "object") continue;
+      if (envelope.has_more === false) return null;
+      const cursor = envelope.last_id ?? envelope.next_cursor ?? envelope.cursor ?? envelope.after ?? null;
+      if (cursor) return cursor;
+    }
+    return null;
   }
 
   /** Page through an endpoint until it stops returning anything new.
