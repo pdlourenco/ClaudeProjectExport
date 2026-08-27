@@ -155,14 +155,20 @@
       : Array.isArray(body?.projects) ? body.projects
       : [];
 
-  function nextCursor(body) {
-    if (Array.isArray(body)) return null;   // bare array: nothing to read, offset paging only
+  /** What the response says about continuing: {done}, {cursor}, or null for "it didn't say".
+   *
+   * The three are genuinely different. "Done" means stop — probing further with an offset
+   * would re-fetch page one and look like a stall. Null means we have to try an offset to
+   * find out, because a bare array tells us nothing either way.
+   */
+  function pagingHint(body) {
+    if (Array.isArray(body)) return null;   // bare array: says nothing; offset is the only lever
     // conversations_v2 answers {data, pagination}; other listings put these at the top level.
     for (const envelope of [body?.pagination, body]) {
       if (!envelope || typeof envelope !== "object") continue;
-      if (envelope.has_more === false) return null;
+      if (envelope.has_more === false) return { done: true };
       const cursor = envelope.last_id ?? envelope.next_cursor ?? envelope.cursor ?? envelope.after ?? null;
-      if (cursor) return cursor;
+      if (cursor) return { cursor };
     }
     return null;
   }
@@ -186,7 +192,14 @@
       let got = null;
       if (chosen >= 0) {
         // Stay on the candidate that answered the first page.
-        const body = await attempt(paths[chosen]);
+        let body = await attempt(paths[chosen]);
+        if (body === null) {
+          const status = tried[tried.length - 1]?.status;
+          if (status === 429 || (status >= 500 && status < 600)) {
+            await sleep(Math.max(DELAY_MS * 8, 2000));   // our own pace is the likely cause
+            body = await attempt(paths[chosen]);
+          }
+        }
         if (body !== null) got = { body, path: paths[chosen] };
       } else {
         for (let i = 0; i < paths.length; i++) {
@@ -195,7 +208,17 @@
           await sleep(DELAY_MS);
         }
       }
-      if (!got) return path ? { items, path } : null;
+      if (!got) {
+        // A listing that dies partway is the worst case: it returns real data, so nothing
+        // downstream can tell the mapping is short, and every affected project reports
+        // "exact" over whatever arrived.
+        if (chosen >= 0) {
+          console.warn(`  ! ${label}: stopped after ${items.length} items — HTTP ` +
+                       `${tried[tried.length - 1]?.status} on page ${pages + 1}. The mapping is ` +
+                       `probably incomplete; re-run in a minute.`);
+        }
+        return path ? { items, path } : null;
+      }
       path = got.path;
 
       const batch = asList(got.body);
@@ -210,7 +233,10 @@
 
       if (!batch.length) break;                 // exhausted
       if (fresh === 0) { stalled = true; break; } // same page again: paging is not working
-      cursor = nextCursor(got.body);
+
+      const hint = pagingHint(got.body);
+      if (hint?.done) break;                    // the response said so; do not probe further
+      cursor = hint?.cursor ?? null;
       if (++pages >= MAX_PAGES) {
         console.warn(`  ! Stopped at ${MAX_PAGES} pages for ${label}; raise MAX_PAGES.`);
         break;
@@ -218,10 +244,14 @@
       await sleep(DELAY_MS);
     }
 
-    if (stalled && items.length >= PAGE_SIZE) {
-      console.warn(`  ! ${label}: the next page repeated the previous one, so this listing ` +
-                   `is probably capped at ${items.length}. Neither a cursor nor ?offset= ` +
-                   `advanced it — check the counts below against the web app.`);
+    if (stalled) {
+      // Deliberately unconditional. A complete listing from an endpoint that ignores paging
+      // stalls identically to one that is capped — the responses are the same, the truth is
+      // not — so the choice is between a nuisance line on a good run and a silently short
+      // mapping on a bad one. One of those is recoverable.
+      console.warn(`  ! ${label}: paging did not advance past ${items.length} items. Either the ` +
+                   `listing is complete and this endpoint ignores paging, or it is capped ` +
+                   `there — check ${items.length} against the web app.`);
     }
     return { items, path };
   }

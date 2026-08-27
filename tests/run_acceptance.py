@@ -267,6 +267,24 @@ def main():
         proc = run(EXTRACTOR, zip_path, "--mapping", stale_path, "--json")
         check("stale mapping warns and continues", "WARNING:" in proc.stderr and proc.returncode == 0)
 
+        # ── The browser script's paging ──────────────────────────────────────
+        # fetch_mapping.js is the one piece of this repo that is not Python, and its paging is
+        # the most intricate logic in it — a real run silently returned a third of the data
+        # before it was fixed. Covered by node when node is here, skipped when it is not; the
+        # tool itself stays stdlib-Python either way.
+        print("\nBrowser script paging")
+        if shutil.which("node") is None:
+            skip("fetch_mapping.js paging scenarios", "node is not installed")
+        else:
+            proc = subprocess.run(["node", str(ROOT / "tests" / "paging_check.mjs")],
+                                  capture_output=True, text=True)
+            summary = (proc.stdout.strip().splitlines() or ["no output"])[-1]
+            check("fetch_mapping.js paging scenarios", proc.returncode == 0, summary)
+            if proc.returncode != 0:
+                for line in proc.stdout.splitlines():
+                    if "FAIL" in line:
+                        print(f"      {line.strip()}")
+
         # ── Source constraints ───────────────────────────────────────────────
         print("\nSource constraints")
         tree_ast = ast.parse(EXTRACTOR.read_text(encoding="utf-8"))
