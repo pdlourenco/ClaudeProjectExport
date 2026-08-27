@@ -357,6 +357,47 @@ Conversations that carry no reasoning simply have no file — on that same expor
 unfiled conversations had any. Blocks that are empty, or whose text the export withheld, are
 skipped rather than written as empty sections.
 
+### Can I extract everything, losing nothing?
+
+`--faithful`:
+
+```bash
+python claude_export_extractor.py export.zip --faithful
+```
+
+The markdown transcript is a readable rendering, and a rendering leaves things out. On one
+real export, 55 fields present in the source never reached the output — among them which tool
+ran and what it returned (~3,300 of each), the sources cited behind claims, the conversation's
+own summary, and the reply-threading ids.
+
+`--faithful` does two things about that:
+
+- **Renders the parts worth reading** into the transcripts — tool calls and their results
+  including failures, cited sources, the conversation summary, names of non-text files — and
+  the condensed reasoning summaries into `thinking/`. It implies `--thinking`.
+- **Writes every source record verbatim** to `raw/`, one JSON file per conversation under the
+  same filename as its transcript, plus `raw/project.json` and the account-level files
+  (`users.json`, `memories.json`, `login_history.json`) under `raw/account/`.
+
+```
+<output_dir>/
+├── conversations/   Weekly sync.md
+├── thinking/        Weekly sync.md
+└── raw/
+    ├── project.json
+    ├── account/     users.json, memories.json, login_history.json
+    └── conversations/  Weekly sync.json     # the source record, untouched
+```
+
+The `raw/` half is what makes "loses nothing" checkable rather than aspirational: the test
+suite reads each written record back and compares it to the source object. It also means
+fields this tool doesn't understand — including ones Claude.ai adds later — survive
+extraction without needing a code change.
+
+Account-level files are written once, into the `--unfiled` directory if you gave one and
+otherwise beside the first project, since they aren't project data and copying them into every
+folder would be duplication rather than completeness.
+
 ### Does this work with Claude.ai Team/Enterprise exports?
 
 It should work with any Claude.ai data export that follows the standard format (`conversations.json`, `projects.json`). The schema is auto-detected.

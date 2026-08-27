@@ -49,9 +49,9 @@ def skip(name, detail):
     print(f"  [SKIP] {name} — {detail}")
 
 
-def run(script, *args, expect_rc=0):
+def run(script, *args, expect_rc=0, stdin="q\n"):
     proc = subprocess.run([sys.executable, str(script), *map(str, args)],
-                          capture_output=True, text=True, input="q\n")
+                          capture_output=True, text=True, input=stdin)
     if expect_rc is not None and proc.returncode != expect_rc:
         raise AssertionError(f"rc={proc.returncode} (wanted {expect_rc})\n{proc.stdout}\n{proc.stderr}")
     return proc
@@ -314,6 +314,75 @@ def main():
         cr = sorted(f.name for f in (collide_out / "thinking").glob("*.md"))
         check("colliding titles: reasoning filenames track the disambiguated transcripts",
               ct == cr and len(ct) == 3, f"{ct} vs {cr}")
+
+        # ── Faithful export ──────────────────────────────────────────────────
+        print("\nFaithful export")
+        faith = tmp / "faithful"
+        proc = run(EXTRACTOR, zip_path, "--faithful", "--extract", "1", "--output", faith)
+
+        # The claim is losslessness, so the check is a round trip, not a spot check.
+        source = {c["uuid"]: c for c in json.loads(
+            zipfile.ZipFile(zip_path).read("conversations.json"))}
+        raws = sorted((faith / "raw" / "conversations").glob("*.json"))
+        differing = [f.name for f in raws
+                     if json.loads(f.read_text(encoding="utf-8")) != source.get(
+                         json.loads(f.read_text(encoding="utf-8")).get("uuid"))]
+        check("every raw record round-trips identical to the source object",
+              raws and not differing, f"{len(raws)} records, differing: {differing or 'none'}")
+
+        src_projects = json.loads(zipfile.ZipFile(zip_path).read("projects.json"))
+        proj_raw = json.loads((faith / "raw" / "project.json").read_text(encoding="utf-8"))
+        check("the project record round-trips identical to the source object",
+              proj_raw == next(p for p in src_projects if p["uuid"] == proj_raw["uuid"]))
+
+        check("account-level files are carried across",
+              sorted(f.name for f in (faith / "raw" / "account").glob("*.json")) == ["users.json"],
+              "the fixture has only users.json alongside projects and conversations")
+
+        transcripts = "\n".join(f.read_text(encoding="utf-8")
+                                for f in (faith / "conversations").glob("*.md"))
+        check("tool calls reach the transcript", "Tool call — search_docs" in transcripts)
+        check("tool results reach the transcript", "Tool result — search_docs" in transcripts)
+        check("a failed tool call is marked", "**error**" in transcripts)
+        check("citations reach the transcript", "Example Source" in transcripts)
+        check("the conversation's own summary reaches the transcript",
+              "SUMMARY OF THIS CHAT" in transcripts)
+        check("non-text file names reach the transcript", "[File: diagram.png]" in transcripts)
+
+        reasoning = "\n".join(f.read_text(encoding="utf-8")
+                              for f in (faith / "thinking").glob("*.md"))
+        check("thinking summaries reach the reasoning files", "CONDENSED REASONING" in reasoning)
+        check("--faithful implies --thinking", (faith / "thinking").exists())
+
+        # Account files have to reach a directory the run actually writes to, including a
+        # default one derived from the project name — the two commonest invocations.
+        defaults = tmp / "defaults"
+        defaults.mkdir()
+        proc = subprocess.run([sys.executable, str(EXTRACTOR), str(zip_path),
+                               "--faithful", "--extract", "1"],
+                              capture_output=True, text=True, input="q\n", cwd=defaults)
+        landed = list(defaults.rglob("raw/account/*.json"))
+        check("account files land when output directories are left to default",
+              bool(landed), f"{[f.name for f in landed] or 'nothing copied'}")
+
+        interactive = tmp / "interactive"
+        interactive.mkdir()
+        subprocess.run([sys.executable, str(EXTRACTOR), str(zip_path), "--faithful"],
+                       capture_output=True, text=True, input="1\n\ny\n", cwd=interactive)
+        check("account files land from an interactive run",
+              bool(list(interactive.rglob("raw/account/*.json"))))
+
+        # A listing is a read. It must not put anything on disk.
+        listing = tmp / "listing"
+        listing.mkdir()
+        run(EXTRACTOR, zip_path, "--faithful", "--json", "--mapping", mapping_path,
+            "--unfiled", listing / "dump")
+        check("a --json listing writes nothing, even with --faithful",
+              not list(listing.rglob("*")), f"{[str(f) for f in listing.rglob('*')][:3]}")
+
+        plain2 = tmp / "not_faithful"
+        run(EXTRACTOR, zip_path, "--extract", "1", "--output", plain2)
+        check("no raw folder without --faithful", not (plain2 / "raw").exists())
 
         # ── The browser script's paging ──────────────────────────────────────
         # fetch_mapping.js is the one piece of this repo that is not Python, and its paging is
