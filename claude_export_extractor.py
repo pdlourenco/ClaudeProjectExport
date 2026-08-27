@@ -9,6 +9,7 @@ Usage:
     python claude_export_extractor.py <path_to_zip>
     python claude_export_extractor.py <path_to_zip> --json       # machine-readable project list
     python claude_export_extractor.py <path_to_zip> --extract <project_nums> --output <dirs>
+    python claude_export_extractor.py <path_to_zip> --mapping mapping.json
 
 Examples:
     # Interactive mode — pick projects, set output dirs
@@ -19,6 +20,15 @@ Examples:
 
     # Non-interactive — extract projects 1,3 to specific dirs
     python claude_export_extractor.py export.zip --extract 1,3 --output "/path/one,/path/two"
+
+    # Exact conversation-to-project join, using a mapping produced by fetch_mapping.js
+    python claude_export_extractor.py export.zip --mapping mapping.json
+
+    # Exact join, falling back to keyword matching for projects the mapping misses
+    python claude_export_extractor.py export.zip --mapping mapping.json --fuzzy
+
+    # Also save the conversations that belong to no project at all
+    python claude_export_extractor.py export.zip --mapping mapping.json --unfiled ./_unfiled
 """
 
 import zipfile
@@ -27,7 +37,7 @@ import re
 import sys
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -175,14 +185,162 @@ def _as_projects(blob):
     return []
 
 
-def build_project_index(projects, conversations):
-    """Build an enriched index of projects with doc counts and matched conversations."""
+# ── Conversation mapping ──────────────────────────────────────────────────────
+
+MAPPING_SCHEMA = 1
+
+
+class MappingError(Exception):
+    """Raised when a mapping file is missing, malformed, or of an unknown schema."""
+
+
+def load_mapping(path: Path) -> dict:
+    """Load and validate an external conversation-to-project mapping file.
+
+    Claude.ai's export does not record which project a conversation belongs to, so the
+    mapping is produced separately from a logged-in browser session (see fetch_mapping.js)
+    and passed in with --mapping. Schema v1:
+
+        {
+          "schema": 1,
+          "fetched_at": "2026-08-20T10:00:00Z",
+          "org_uuid": "...",
+          "projects": {"<project_uuid>": "<project name>"},          # optional
+          "conversations": {
+            "<conversation_uuid>": {"project_uuid": "...", "project_name": "..."}
+          }
+        }
+
+    The optional "projects" key lists every project the fetch saw. It lets a project with
+    no conversations report an honest "exact" match of zero, rather than looking uncovered.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise MappingError(f"Mapping file not found: {path}")
+    except OSError as exc:
+        raise MappingError(f"Could not read mapping file {path}: {exc}")
+    except json.JSONDecodeError as exc:
+        raise MappingError(f"Mapping file is not valid JSON ({path}): {exc}")
+
+    if not isinstance(raw, dict):
+        raise MappingError(
+            f"Mapping file must contain a JSON object, found {type(raw).__name__}: {path}"
+        )
+
+    schema = raw.get("schema")
+    if schema != MAPPING_SCHEMA:
+        raise MappingError(
+            f"Unsupported mapping schema {schema!r} in {path} — this tool understands schema "
+            f"{MAPPING_SCHEMA}. Re-run fetch_mapping.js to produce a current mapping file."
+        )
+
+    convs = raw.get("conversations")
+    if not isinstance(convs, dict):
+        raise MappingError(f"Mapping file has no 'conversations' object: {path}")
+
+    cleaned = {}
+    for conv_uuid, entry in convs.items():
+        if not isinstance(entry, dict):
+            raise MappingError(
+                f"Mapping entry for conversation {conv_uuid} must be an object: {path}"
+            )
+        project_uuid = entry.get("project_uuid")
+        if not project_uuid:
+            raise MappingError(
+                f"Mapping entry for conversation {conv_uuid} has no 'project_uuid': {path}"
+            )
+        cleaned[conv_uuid] = {
+            "project_uuid": project_uuid,
+            "project_name": entry.get("project_name", ""),
+        }
+
+    projects = raw.get("projects")
+    if projects is not None and not isinstance(projects, dict):
+        raise MappingError(f"Mapping file's optional 'projects' key must be an object: {path}")
+
+    return {
+        "schema": schema,
+        "fetched_at": raw.get("fetched_at", ""),
+        "org_uuid": raw.get("org_uuid", ""),
+        "projects": projects or {},
+        "conversations": cleaned,
+    }
+
+
+def _parse_iso(value: str):
+    """Parse an ISO-8601 timestamp into an aware datetime, or None if unparseable."""
+    try:
+        dt = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def mapping_staleness(mapping, conversations):
+    """Return (fetched_at, newest_update) when the mapping predates the export, else None.
+
+    A mapping fetched before the export's most recent conversation activity cannot know
+    about anything created since. Those conversations are simply unmapped, so the result
+    is incomplete rather than wrong — worth a warning, not a refusal.
+    """
+    fetched = _parse_iso(mapping.get("fetched_at", ""))
+    if not fetched:
+        return None
+
+    newest = None
+    for conv in conversations:
+        updated = _parse_iso(conv.get("updated_at", ""))
+        if updated and (newest is None or updated > newest):
+            newest = updated
+
+    if newest and fetched < newest:
+        return fetched, newest
+    return None
+
+
+def build_project_index(projects, conversations, mapping=None, allow_fuzzy=True):
+    """Build an enriched index of projects with doc counts and matched conversations.
+
+    Conversations reach a project by one of three strategies, recorded per entry:
+      "exact" — joined by UUID through a mapping file (see load_mapping)
+      "fuzzy" — keyword similarity between the project name and conversation titles
+      "none"  — the mapping does not cover this project and fuzzy matching is off
+
+    "exact" means none of the project's conversations were guessed at. It does not mean the
+    project is complete: a conversation created after the mapping was fetched, or missed by a
+    truncated fetch, is in the export but not in the mapping. Keyword matching is not used to
+    fill those gaps — a covered project never falls back — so no project mixes joined and
+    guessed conversations. Such conversations end up unfiled, where they are visible.
+    """
     # Build keyword-to-conversation mapping
     conv_name_index = []
     for conv in conversations:
         name = (conv.get("name") or "").lower()
         msg_count = len(conv.get("chat_messages") or conv.get("messages") or [])
         conv_name_index.append((name, msg_count, conv))
+
+    # Exact join: group conversations under the project UUID the mapping assigns them.
+    by_project = defaultdict(list)
+    covered = set()
+    if mapping:
+        for conv in conversations:
+            entry = mapping["conversations"].get(conv.get("uuid"))
+            if entry:
+                by_project[entry["project_uuid"]].append(conv)
+        # Union, not a fallback: "projects" exists so a project with no conversations can
+        # still report an honest exact match of zero, but a hand-edited mapping whose
+        # "projects" omits a project its conversations reference must not strand them.
+        covered = set(mapping["projects"]) | set(by_project)
+
+    # Keyword matching draws only from conversations the mapping leaves unfiled. The mapping
+    # is authoritative: an uncovered project has no business guessing at a conversation that
+    # is known to belong somewhere else. This also keeps the exact and guessed sets disjoint,
+    # so every conversation is filed, guessed, or unfiled — never two of the three.
+    fuzzy_pool = conv_name_index
+    if mapping:
+        fuzzy_pool = [row for row in conv_name_index
+                      if row[2].get("uuid") not in mapping["conversations"]]
 
     index = []
     for proj in projects:
@@ -209,12 +367,13 @@ def build_project_index(projects, conversations):
         # Count total content size
         total_kb = sum(len(d.get("content", "")) for d in unique_docs) / 1024
 
-        # Match conversations by project name keywords
-        keywords = _project_keywords(name)
-        matched_convos = []
-        for cname, mcnt, conv in conv_name_index:
-            if any(k in cname for k in keywords):
-                matched_convos.append(conv)
+        # Attach conversations: exact where the mapping covers this project, else keywords
+        if mapping and uuid in covered:
+            matched_convos, strategy = by_project.get(uuid, []), "exact"
+        elif allow_fuzzy:
+            matched_convos, strategy = _keyword_match(name, fuzzy_pool), "fuzzy"
+        else:
+            matched_convos, strategy = [], "none"
 
         index.append({
             "name": name,
@@ -227,9 +386,20 @@ def build_project_index(projects, conversations):
             "total_kb": total_kb,
             "matched_conversations": matched_convos,
             "conv_count": len(matched_convos),
+            "strategy": strategy,
         })
 
     return index
+
+
+def _keyword_match(project_name: str, conv_name_index) -> list:
+    """Return conversations whose title contains any keyword from the project name."""
+    keywords = _project_keywords(project_name)
+    matched_convos = []
+    for cname, mcnt, conv in conv_name_index:
+        if any(k in cname for k in keywords):
+            matched_convos.append(conv)
+    return matched_convos
 
 
 def _project_keywords(project_name: str) -> list:
@@ -247,8 +417,13 @@ def _project_keywords(project_name: str) -> list:
 
 # ── Extraction ────────────────────────────────────────────────────────────────
 
-def extract_project(entry, output_dir: Path):
-    """Extract a single project's docs and conversations to the output directory."""
+def extract_project(entry, output_dir: Path, record_strategy: bool = False):
+    """Extract a single project's docs and conversations to the output directory.
+
+    record_strategy notes in the saved metadata how the conversations were matched. It is
+    only meaningful when a mapping was supplied; without one every project is matched the
+    same way and the field would say nothing.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     docs_dir = output_dir / "project_knowledge"
@@ -267,6 +442,9 @@ def extract_project(entry, output_dir: Path):
         "doc_count": entry["doc_count"],
         "conversation_count": entry["conv_count"],
     }
+    if record_strategy:
+        # "exact" — joined by UUID; "fuzzy" — guessed from the project name; "none" — not matched
+        meta["conversation_match"] = entry["strategy"]
     (docs_dir / "_project_metadata.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
@@ -301,58 +479,123 @@ def extract_project(entry, output_dir: Path):
         conv_names = NameAllocator(conv_dir)
 
         for conv in entry["matched_conversations"]:
-            title = conv.get("name") or "Untitled"
-            conv_id = conv.get("uuid", "unknown")
-            created = ts(conv.get("created_at", ""))
-            updated = ts(conv.get("updated_at", ""))
-            messages = conv.get("chat_messages") or conv.get("messages") or []
-
-            lines = [
-                f"# {title}\n",
-                f"- **ID:** {conv_id}",
-                f"- **Created:** {created}",
-                f"- **Updated:** {updated}",
-                f"- **Messages:** {len(messages)}\n",
-                "---\n",
-            ]
-
-            for msg in messages:
-                role = (msg.get("sender") or msg.get("role") or "unknown").upper()
-                msg_ts = ts(msg.get("created_at", ""))
-
-                content = _extract_message_content(msg)
-
-                attachments = msg.get("attachments") or msg.get("files") or []
-                attach_notes = []
-                for att in attachments:
-                    fname = att.get("file_name") or att.get("name") or "attachment"
-                    ftype = att.get("file_type") or att.get("type") or ""
-                    attach_notes.append(f"[Attachment: {fname} ({ftype})]")
-                    # Save text-based attachment content
-                    att_content = att.get("extracted_content") or att.get("content") or ""
-                    if att_content and len(att_content) > 50:
-                        att_ext = detect_extension(att_content, fname)
-                        att_safe = safe_name(fname) + att_ext
-                        att_path = docs_dir / att_safe
-                        if not att_path.exists():
-                            att_path.write_text(att_content, encoding="utf-8",
-                                                errors="backslashreplace")
-
-                lines.append(f"### {role}  _{msg_ts}_\n")
-                if content:
-                    lines.append(content.strip())
-                    lines.append("")
-                for note in attach_notes:
-                    lines.append(f"> {note}")
-                if attach_notes:
-                    lines.append("")
-                lines.append("---\n")
-
-            out_path = conv_names.allocate(safe_name(title) + ".md")
-            out_path.write_text("\n".join(lines), encoding="utf-8",
-                                errors="backslashreplace")
+            stats["convs_msgs"] += write_conversation(conv, conv_names, docs_dir)
             stats["conversations"] += 1
-            stats["convs_msgs"] += len(messages)
+
+    return stats
+
+
+def write_conversation(conv, names: NameAllocator, attach_dir: Path) -> int:
+    """Write one conversation as markdown, via `names`; return its message count.
+
+    Text content from attachments is written alongside, into attach_dir. The allocator is
+    passed in rather than built here so that a whole directory's worth of conversations
+    shares one — conversations sharing a title need to see each other's names, and a
+    directory left over from an earlier run needs to be refreshed rather than duplicated.
+    """
+    title = conv.get("name") or "Untitled"
+    conv_id = conv.get("uuid", "unknown")
+    created = ts(conv.get("created_at", ""))
+    updated = ts(conv.get("updated_at", ""))
+    messages = conv.get("chat_messages") or conv.get("messages") or []
+
+    lines = [
+        f"# {title}\n",
+        f"- **ID:** {conv_id}",
+        f"- **Created:** {created}",
+        f"- **Updated:** {updated}",
+        f"- **Messages:** {len(messages)}\n",
+        "---\n",
+    ]
+
+    for msg in messages:
+        role = (msg.get("sender") or msg.get("role") or "unknown").upper()
+        msg_ts = ts(msg.get("created_at", ""))
+
+        content = _extract_message_content(msg)
+
+        attachments = msg.get("attachments") or msg.get("files") or []
+        attach_notes = []
+        for att in attachments:
+            fname = att.get("file_name") or att.get("name") or "attachment"
+            ftype = att.get("file_type") or att.get("type") or ""
+            attach_notes.append(f"[Attachment: {fname} ({ftype})]")
+            # Save text-based attachment content
+            att_content = att.get("extracted_content") or att.get("content") or ""
+            if att_content and len(att_content) > 50:
+                att_ext = detect_extension(att_content, fname)
+                att_safe = safe_name(fname) + att_ext
+                attach_dir.mkdir(parents=True, exist_ok=True)
+                att_path = attach_dir / att_safe
+                if not att_path.exists():
+                    att_path.write_text(att_content, encoding="utf-8",
+                                        errors="backslashreplace")
+
+        lines.append(f"### {role}  _{msg_ts}_\n")
+        if content:
+            lines.append(content.strip())
+            lines.append("")
+        for note in attach_notes:
+            lines.append(f"> {note}")
+        if attach_notes:
+            lines.append("")
+        lines.append("---\n")
+
+    out_path = names.allocate(safe_name(title) + ".md")
+    out_path.write_text("\n".join(lines), encoding="utf-8", errors="backslashreplace")
+    return len(messages)
+
+
+def _conv_key(conv):
+    """Identity for a conversation. Falls back to object identity if the export omits a UUID."""
+    return conv.get("uuid") or id(conv)
+
+
+def unfiled_conversations(index, conversations):
+    """Return conversations that no project claimed, by any strategy.
+
+    A conversation a project guessed at is not unfiled — it already has a home, however
+    tentative, and writing it to both places would double-count it. What is left over is
+    genuinely unaccounted for, which can mean any of:
+
+      * a standalone chat that never belonged to a project
+      * a chat from a project deleted since, so the mapping points at a project the export
+        does not contain
+      * a chat created after the mapping was fetched
+
+    The export does not distinguish these, so neither does this function.
+
+    Requires a mapping — keyword matching alone lets one conversation match several projects
+    and leaves most of them matched by nothing, so "unfiled" carries no information without
+    an exact join to measure against.
+    """
+    claimed = {_conv_key(conv) for entry in index for conv in entry["matched_conversations"]}
+    return [conv for conv in conversations if _conv_key(conv) not in claimed]
+
+
+def strategy_counts(index):
+    """Count distinct conversations claimed by each strategy.
+
+    Distinct, because two uncovered projects can guess at the same conversation. The exact
+    and fuzzy sets never overlap — see the fuzzy_pool note in build_project_index — so these
+    counts plus the unfiled count add up to the export's conversation total.
+    """
+    return {
+        name: len({_conv_key(conv) for entry in index if entry["strategy"] == name
+                   for conv in entry["matched_conversations"]})
+        for name in ("exact", "fuzzy")
+    }
+
+
+def extract_unfiled(conversations, output_dir: Path):
+    """Write every unfiled conversation into a single bucket directory."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stats = {"conversations": 0, "convs_msgs": 0}
+    names = NameAllocator(output_dir)
+    for conv in conversations:
+        stats["convs_msgs"] += write_conversation(conv, names, output_dir / "attachments")
+        stats["conversations"] += 1
 
     return stats
 
@@ -402,22 +645,34 @@ def _extract_message_content(msg) -> str:
 
 # ── Display ───────────────────────────────────────────────────────────────────
 
-def print_project_list(index):
-    """Print a numbered list of projects."""
-    print(f"\n{'#':>3}  {'Project Name':<50}  {'Docs':>5}  {'Convos':>6}  {'Size':>8}  {'Created':>10}")
-    print("─" * 95)
+def print_project_list(index, show_strategy: bool = False):
+    """Print a numbered list of projects.
+
+    The match-strategy column only appears when a mapping is in play; without one every
+    project is matched the same way and the column carries no information.
+    """
+    header = [f"{'#':>3}", f"{'Project Name':<50}", f"{'Docs':>5}", f"{'Convos':>6}"]
+    if show_strategy:
+        header.append(f"{'Match':>6}")
+    header += [f"{'Size':>8}", f"{'Created':>10}"]
+    print("\n" + "  ".join(header))
+    print("─" * (103 if show_strategy else 95))
     for i, entry in enumerate(index, 1):
         name = entry["name"][:48]
         size = f"{entry['total_kb']:.0f} KB" if entry["total_kb"] < 1024 else f"{entry['total_kb']/1024:.1f} MB"
-        print(f"{i:>3}  {name:<50}  {entry['doc_count']:>5}  {entry['conv_count']:>6}  {size:>8}  {entry['created']:>10}")
+        row = [f"{i:>3}", f"{name:<50}", f"{entry['doc_count']:>5}", f"{entry['conv_count']:>6}"]
+        if show_strategy:
+            row.append(f"{entry['strategy']:>6}")
+        row += [f"{size:>8}", f"{entry['created']:>10}"]
+        print("  ".join(row))
     print(f"\nTotal: {len(index)} projects")
 
 
-def print_json_index(index):
+def print_json_index(index, show_strategy: bool = False):
     """Print machine-readable JSON index for Claude Code skill automation."""
     output = []
     for i, entry in enumerate(index, 1):
-        output.append({
+        record = {
             "number": i,
             "name": entry["name"],
             "uuid": entry["uuid"],
@@ -427,7 +682,10 @@ def print_json_index(index):
             "conv_count": entry["conv_count"],
             "total_kb": round(entry["total_kb"], 1),
             "has_prompt": bool(entry["prompt_template"]),
-        })
+        }
+        if show_strategy:
+            record["strategy"] = entry["strategy"]
+        output.append(record)
     print(json.dumps(output, indent=2))
 
 
@@ -471,20 +729,18 @@ def assert_distinct_dirs(plan):
         by_dir[resolved] = entry
 
 
-def extract_or_exit(entry, out_dir: Path):
+def extract_or_exit(entry, out_dir: Path, record_strategy: bool = False):
     """Extract one project, turning filesystem refusals into a one-line error."""
     try:
-        return extract_project(entry, out_dir)
+        return extract_project(entry, out_dir, record_strategy)
     except OSError as exc:
         print(f"ERROR: Cannot write to {out_dir}: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
-
-
-def interactive_mode(index):
+def interactive_mode(index, show_strategy: bool = False):
     """Run interactive project selection and extraction."""
-    print_project_list(index)
+    print_project_list(index, show_strategy)
 
     print("\nEnter project numbers to extract (comma-separated, e.g. '1,3,5')")
     print("Or 'all' to extract everything, or 'q' to quit:")
@@ -492,7 +748,7 @@ def interactive_mode(index):
 
     if choice.lower() in ("q", "quit", "exit"):
         print("Cancelled.")
-        return
+        return False
 
     if choice.lower() == "all":
         selected = list(range(len(index)))
@@ -502,10 +758,10 @@ def interactive_mode(index):
             for s in selected:
                 if s < 0 or s >= len(index):
                     print(f"Invalid number: {s+1}")
-                    return
+                    return False
         except ValueError:
             print("Invalid input. Enter numbers separated by commas.")
-            return
+            return False
 
     # Ask for output directories
     extractions = []
@@ -525,21 +781,22 @@ def interactive_mode(index):
     for entry, out_dir in extractions:
         print(f"  {entry['name']}")
         print(f"    -> {out_dir}")
-        print(f"    {entry['doc_count']} docs, {entry['conv_count']} conversations")
+        matched_by = f" ({entry['strategy']} match)" if show_strategy else ""
+        print(f"    {entry['doc_count']} docs, {entry['conv_count']} conversations{matched_by}")
     print()
     confirm = prompt("Proceed? [Y/n] ").strip()
     if confirm.lower() in ("n", "no"):
         print("Cancelled.")
-        return
+        return False
 
     # Extract
     for entry, out_dir in extractions:
         print(f"\nExtracting: {entry['name']} -> {out_dir}")
-        stats = extract_or_exit(entry, out_dir)
+        stats = extract_or_exit(entry, out_dir, show_strategy)
         print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
         print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
-    print("\nDone!")
+    return True
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -555,6 +812,16 @@ def main():
                         help="Comma-separated project numbers to extract (non-interactive)")
     parser.add_argument("--output", type=str, default=None,
                         help="Comma-separated output directories (one per project)")
+    parser.add_argument("--mapping", type=str, default=None,
+                        help="Path to a conversation-to-project mapping file produced by "
+                             "fetch_mapping.js. Joins conversations to projects by UUID "
+                             "instead of guessing from names.")
+    parser.add_argument("--fuzzy", action="store_true",
+                        help="Fall back to keyword matching for projects the mapping does not "
+                             "cover. Without --mapping, keyword matching is used regardless.")
+    parser.add_argument("--unfiled", type=str, default=None, metavar="DIR",
+                        help="Also write conversations that belong to no project into DIR, "
+                             "e.g. ./_unfiled. Requires --mapping.")
 
     # A lone UTF-16 surrogate in a project or conversation name would otherwise abort the
     # run on the first print, before anything is written. JSON allows them, so survive them.
@@ -568,6 +835,23 @@ def main():
     if not zip_path.exists():
         print(f"ERROR: File not found: {zip_path}", file=sys.stderr)
         sys.exit(1)
+
+    if args.unfiled and not args.mapping:
+        print("ERROR: --unfiled requires --mapping — without an exact join there is no way to "
+              "tell which conversations are unfiled.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.fuzzy and not args.mapping:
+        print("NOTE: --fuzzy has no effect without --mapping; keyword matching is already the "
+              "default.", file=sys.stderr)
+
+    mapping = None
+    if args.mapping:
+        try:
+            mapping = load_mapping(Path(args.mapping))
+        except MappingError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     print(f"Loading: {zip_path}", file=sys.stderr if args.json else sys.stdout)
     try:
@@ -584,13 +868,32 @@ def main():
     except OSError as exc:
         print(f"ERROR: Could not read {zip_path}: {exc}", file=sys.stderr)
         sys.exit(1)
-    index = build_project_index(projects, conversations)
+
+    if mapping:
+        stale = mapping_staleness(mapping, conversations)
+        if stale:
+            fetched, newest = (dt.astimezone(timezone.utc) for dt in stale)
+            print(f"WARNING: mapping was fetched {fetched:%Y-%m-%d %H:%M UTC} but the export has "
+                  f"conversation activity up to {newest:%Y-%m-%d %H:%M UTC}. Anything filed since "
+                  f"the fetch will look unmapped — re-run fetch_mapping.js for a current mapping.",
+                  file=sys.stderr)
+
+    index = build_project_index(projects, conversations, mapping=mapping,
+                                allow_fuzzy=(mapping is None or args.fuzzy))
     print(f"Found {len(index)} projects, {len(conversations)} conversations",
           file=sys.stderr if args.json else sys.stdout)
 
+    unfiled = []
+    if mapping:
+        unfiled = unfiled_conversations(index, conversations)
+        counts = strategy_counts(index)
+        print(f"Mapping: {counts['exact']} conversations filed by UUID, "
+              f"{counts['fuzzy']} guessed by keyword, {len(unfiled)} unfiled",
+              file=sys.stderr if args.json else sys.stdout)
+
     # JSON mode — machine-readable output for Claude Code
     if args.json:
-        print_json_index(index)
+        print_json_index(index, show_strategy=mapping is not None)
         return
 
     # Non-interactive mode — extract specified projects
@@ -627,15 +930,28 @@ def main():
 
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
-            stats = extract_or_exit(entry, out_dir)
+            stats = extract_or_exit(entry, out_dir, mapping is not None)
             print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
             print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
+        _extract_unfiled(args.unfiled, unfiled)
         print("\nDone!")
         return
 
     # Interactive mode
-    interactive_mode(index)
+    if interactive_mode(index, show_strategy=mapping is not None):
+        _extract_unfiled(args.unfiled, unfiled)
+        print("\nDone!")
+
+
+def _extract_unfiled(unfiled_dir, unfiled):
+    """Write the unfiled bucket, if one was asked for."""
+    if not unfiled_dir:
+        return
+    out_dir = Path(unfiled_dir)
+    print(f"\nExtracting unfiled conversations -> {out_dir}")
+    stats = extract_unfiled(unfiled, out_dir)
+    print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
 
 if __name__ == "__main__":

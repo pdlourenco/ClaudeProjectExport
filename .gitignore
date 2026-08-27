@@ -7,3 +7,7 @@ build/
 *.zip
 claude-export/
 docs/
+
+# Conversation-to-project mapping — contains your project and conversation names
+mapping.json
+fixtures/
