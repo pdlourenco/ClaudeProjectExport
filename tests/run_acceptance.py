@@ -315,6 +315,49 @@ def main():
         check("colliding titles: reasoning filenames track the disambiguated transcripts",
               ct == cr and len(ct) == 3, f"{ct} vs {cr}")
 
+        # ── Faithful export ──────────────────────────────────────────────────
+        print("\nFaithful export")
+        faith = tmp / "faithful"
+        proc = run(EXTRACTOR, zip_path, "--faithful", "--extract", "1", "--output", faith)
+
+        # The claim is losslessness, so the check is a round trip, not a spot check.
+        source = {c["uuid"]: c for c in json.loads(
+            zipfile.ZipFile(zip_path).read("conversations.json"))}
+        raws = sorted((faith / "raw" / "conversations").glob("*.json"))
+        differing = [f.name for f in raws
+                     if json.loads(f.read_text(encoding="utf-8")) != source.get(
+                         json.loads(f.read_text(encoding="utf-8")).get("uuid"))]
+        check("every raw record round-trips identical to the source object",
+              raws and not differing, f"{len(raws)} records, differing: {differing or 'none'}")
+
+        src_projects = json.loads(zipfile.ZipFile(zip_path).read("projects.json"))
+        proj_raw = json.loads((faith / "raw" / "project.json").read_text(encoding="utf-8"))
+        check("the project record round-trips identical to the source object",
+              proj_raw == next(p for p in src_projects if p["uuid"] == proj_raw["uuid"]))
+
+        check("account-level files are carried across",
+              sorted(f.name for f in (faith / "raw" / "account").glob("*.json")) == ["users.json"],
+              "the fixture has only users.json alongside projects and conversations")
+
+        transcripts = "\n".join(f.read_text(encoding="utf-8")
+                                for f in (faith / "conversations").glob("*.md"))
+        check("tool calls reach the transcript", "Tool call — search_docs" in transcripts)
+        check("tool results reach the transcript", "Tool result — search_docs" in transcripts)
+        check("a failed tool call is marked", "**error**" in transcripts)
+        check("citations reach the transcript", "Example Source" in transcripts)
+        check("the conversation's own summary reaches the transcript",
+              "SUMMARY OF THIS CHAT" in transcripts)
+        check("non-text file names reach the transcript", "[File: diagram.png]" in transcripts)
+
+        reasoning = "\n".join(f.read_text(encoding="utf-8")
+                              for f in (faith / "thinking").glob("*.md"))
+        check("thinking summaries reach the reasoning files", "CONDENSED REASONING" in reasoning)
+        check("--faithful implies --thinking", (faith / "thinking").exists())
+
+        plain2 = tmp / "not_faithful"
+        run(EXTRACTOR, zip_path, "--extract", "1", "--output", plain2)
+        check("no raw folder without --faithful", not (plain2 / "raw").exists())
+
         # ── The browser script's paging ──────────────────────────────────────
         # fetch_mapping.js is the one piece of this repo that is not Python, and its paging is
         # the most intricate logic in it — a real run silently returned a third of the data

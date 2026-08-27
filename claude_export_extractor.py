@@ -169,6 +169,26 @@ def load_export(zip_path: Path):
     return unique_projects, conversations
 
 
+def load_account_files(zip_path: Path) -> dict:
+    """Return the archive's JSON files that this tool never reads, name -> bytes.
+
+    users.json, memories.json and login_history.json are account-level rather than project
+    data, so nothing here parses them — which also means nothing here would notice if a
+    future export added another. Matching by exclusion rather than by name keeps that from
+    mattering: whatever is not a project or conversation file is carried across untouched.
+    """
+    out = {}
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        for name in zf.namelist():
+            if not name.endswith(".json"):
+                continue
+            lowered = name.lower()
+            if "project" in lowered or "conversation" in lowered:
+                continue
+            out[Path(name).name] = zf.read(name)
+    return out
+
+
 def _as_projects(blob):
     """Normalise one project file's contents to a list of project records.
 
@@ -387,6 +407,7 @@ def build_project_index(projects, conversations, mapping=None, allow_fuzzy=True)
             "matched_conversations": matched_convos,
             "conv_count": len(matched_convos),
             "strategy": strategy,
+            "source": proj,      # verbatim, for --faithful; nothing else reads it
         })
 
     return index
@@ -418,7 +439,7 @@ def _project_keywords(project_name: str) -> list:
 # ── Extraction ────────────────────────────────────────────────────────────────
 
 def extract_project(entry, output_dir: Path, record_strategy: bool = False,
-                    include_thinking: bool = False):
+                    include_thinking: bool = False, faithful: bool = False):
     """Extract a single project's docs and conversations to the output directory.
 
     record_strategy notes in the saved metadata how the conversations were matched. It is
@@ -482,13 +503,24 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False,
         for conv in entry["matched_conversations"]:
             stats["convs_msgs"] += write_conversation(
                 conv, conv_names, docs_dir,
-                thinking_dir=(output_dir / "thinking") if include_thinking else None)
+                thinking_dir=(output_dir / "thinking") if include_thinking else None,
+                raw_dir=(output_dir / "raw" / "conversations") if faithful else None,
+                faithful=faithful)
             stats["conversations"] += 1
+
+    if faithful and entry.get("source") is not None:
+        # The project record as the export holds it, including the fields the metadata
+        # summary above does not carry and the full doc entries with their own ids.
+        raw_dir = output_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        (raw_dir / "project.json").write_text(
+            json.dumps(entry["source"], indent=2), encoding="utf-8")
 
     return stats
 
 
-def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_dir=None) -> int:
+def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_dir=None,
+                       raw_dir=None, faithful: bool = False) -> int:
     """Write one conversation as markdown, via `names`; return its message count.
 
     Text content from attachments is written alongside, into attach_dir. The allocator is
@@ -500,6 +532,10 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
     under the *same* filename the transcript received. Deliberately not a name of its own:
     two conversations called "Untitled" are disambiguated once, by the allocator, and both
     files inherit that answer — so a transcript and its reasoning always share a name.
+    raw_dir receives the source record verbatim, under that same name again.
+
+    `faithful` adds the parts of a message the transcript drops — which tool ran, what came
+    back, the sources cited — rather than only the prose.
     """
     title = conv.get("name") or "Untitled"
     conv_id = conv.get("uuid", "unknown")
@@ -513,8 +549,11 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
         f"- **Created:** {created}",
         f"- **Updated:** {updated}",
         f"- **Messages:** {len(messages)}\n",
-        "---\n",
     ]
+    summary = (conv.get("summary") or "").strip() if faithful else ""
+    if summary:
+        lines.append(f"> {summary}\n")
+    lines.append("---\n")
 
     thinking_lines = []
     for msg in messages:
@@ -525,10 +564,20 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
 
         if thinking_dir is not None:
             reasoning = _extract_thinking(msg)
-            if reasoning:
+            summaries = []
+            if faithful:
+                for block in (msg.get("content") if isinstance(msg.get("content"), list) else []):
+                    if isinstance(block, dict) and block.get("type") == "thinking":
+                        summaries.extend(_thinking_summaries(block))
+            if reasoning or summaries:
                 thinking_lines.append(f"### {role}  _{msg_ts}_\n")
-                thinking_lines.append(reasoning)
-                thinking_lines.append("")
+                for line in summaries:
+                    thinking_lines.append(f"> {line}")
+                if summaries:
+                    thinking_lines.append("")
+                if reasoning:
+                    thinking_lines.append(reasoning)
+                    thinking_lines.append("")
                 thinking_lines.append("---\n")
 
         attachments = msg.get("attachments") or msg.get("files") or []
@@ -556,10 +605,26 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
             lines.append(f"> {note}")
         if attach_notes:
             lines.append("")
+
+        if faithful:
+            extra = _render_tool_calls(msg) + _render_citations(msg)
+            for f in (msg.get("files") or []):
+                if isinstance(f, dict) and f.get("file_name"):
+                    extra.append(f"> [File: {f['file_name']}]")
+            if extra:
+                lines.extend(extra + [""])
+
         lines.append("---\n")
 
     out_path = names.allocate(safe_name(title) + ".md")
     out_path.write_text("\n".join(lines), encoding="utf-8", errors="backslashreplace")
+
+    if raw_dir is not None:
+        # Verbatim, so that anything this file does not understand — today's unrendered
+        # fields and tomorrow's new ones — survives extraction without a code change.
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        (raw_dir / (out_path.stem + ".json")).write_text(
+            json.dumps(conv, indent=2), encoding="utf-8")
 
     if thinking_lines:
         header = [
@@ -620,7 +685,8 @@ def strategy_counts(index):
     }
 
 
-def extract_unfiled(conversations, output_dir: Path, include_thinking: bool = False):
+def extract_unfiled(conversations, output_dir: Path, include_thinking: bool = False,
+                    faithful: bool = False):
     """Write every unfiled conversation into a single bucket directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -629,10 +695,95 @@ def extract_unfiled(conversations, output_dir: Path, include_thinking: bool = Fa
     for conv in conversations:
         stats["convs_msgs"] += write_conversation(
             conv, names, output_dir / "attachments",
-            thinking_dir=(output_dir / "thinking") if include_thinking else None)
+            thinking_dir=(output_dir / "thinking") if include_thinking else None,
+            raw_dir=(output_dir / "raw" / "conversations") if faithful else None,
+            faithful=faithful)
         stats["conversations"] += 1
 
     return stats
+
+
+def _render_tool_calls(msg) -> list:
+    """Render tool activity that the transcript otherwise reduces to artifact bodies.
+
+    A tool_use block names a tool and carries its input; a tool_result carries what came
+    back, whether it failed, and often a display_content the UI showed instead of the raw
+    result. None of that reaches the transcript, so a conversation driven by tool calls
+    reads as though it happened by magic.
+    """
+    raw = msg.get("content")
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+
+    lines = []
+    for block in raw:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "tool_use":
+            name = block.get("name") or "(unnamed tool)"
+            where = block.get("integration_name")
+            lines.append(f"> **Tool call — {name}**" + (f" _via {where}_" if where else ""))
+            note = block.get("message")
+            if note:
+                lines.append(f"> {note}")
+            inp = block.get("input")
+            if isinstance(inp, dict):
+                # The artifact body is already in the transcript; don't repeat it here.
+                shown = {k: v for k, v in inp.items() if k != "content"}
+                if shown:
+                    lines.append("> ```json")
+                    for row in json.dumps(shown, indent=2)[:2000].splitlines():
+                        lines.append(f"> {row}")
+                    lines.append("> ```")
+            lines.append("")
+        elif btype == "tool_result":
+            name = block.get("name") or "(unnamed tool)"
+            failed = " — **error**" if block.get("is_error") else ""
+            lines.append(f"> **Tool result — {name}**{failed}")
+            for key in ("message", "display_content"):
+                value = block.get(key)
+                if isinstance(value, str) and value.strip():
+                    lines.append(f"> {value.strip()[:2000]}")
+            lines.append("")
+    return lines
+
+
+def _render_citations(msg) -> list:
+    """Render the sources attached to text blocks, which the transcript drops entirely."""
+    raw = msg.get("content")
+    if not isinstance(raw, list):
+        return []
+    seen, lines = set(), []
+    for block in raw:
+        if not isinstance(block, dict):
+            continue
+        for cite in (block.get("citations") or []):
+            if not isinstance(cite, dict):
+                continue
+            url = cite.get("url") or cite.get("uri") or ""
+            title = cite.get("title") or cite.get("source") or url or "source"
+            key = (title, url)
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(f"> [{title}]({url})" if url else f"> {title}")
+    return (["> **Sources**"] + lines + [""]) if lines else []
+
+
+def _thinking_summaries(block) -> list:
+    """The condensed reasoning a thinking block carries alongside its full text."""
+    out = []
+    for item in (block.get("summaries") or []):
+        if isinstance(item, dict):
+            text = (item.get("summary") or "").strip()
+        else:
+            text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
 
 
 def _extract_thinking(msg) -> str:
@@ -790,16 +941,17 @@ def assert_distinct_dirs(plan):
 
 
 def extract_or_exit(entry, out_dir: Path, record_strategy: bool = False,
-                    include_thinking: bool = False):
+                    include_thinking: bool = False, faithful: bool = False):
     """Extract one project, turning filesystem refusals into a one-line error."""
     try:
-        return extract_project(entry, out_dir, record_strategy, include_thinking)
+        return extract_project(entry, out_dir, record_strategy, include_thinking, faithful)
     except OSError as exc:
         print(f"ERROR: Cannot write to {out_dir}: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
-def interactive_mode(index, show_strategy: bool = False, include_thinking: bool = False):
+def interactive_mode(index, show_strategy: bool = False, include_thinking: bool = False,
+                     faithful: bool = False):
     """Run interactive project selection and extraction."""
     print_project_list(index, show_strategy)
 
@@ -853,7 +1005,7 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
     # Extract
     for entry, out_dir in extractions:
         print(f"\nExtracting: {entry['name']} -> {out_dir}")
-        stats = extract_or_exit(entry, out_dir, show_strategy, include_thinking)
+        stats = extract_or_exit(entry, out_dir, show_strategy, include_thinking, faithful)
         print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
         print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
@@ -880,6 +1032,13 @@ def main():
     parser.add_argument("--fuzzy", action="store_true",
                         help="Fall back to keyword matching for projects the mapping does not "
                              "cover. Without --mapping, keyword matching is used regardless.")
+    parser.add_argument("--faithful", action="store_true",
+                        help="Lose nothing. Implies --thinking, adds the parts of a message the "
+                             "transcript drops (which tool ran and what it returned, cited "
+                             "sources, the conversation's own summary, attached file names), "
+                             "and writes every source record verbatim to raw/ so that fields "
+                             "this tool does not render — including ones added in future — "
+                             "survive extraction.")
     parser.add_argument("--thinking", action="store_true",
                         help="Also write Claude's reasoning to a thinking/ folder beside the "
                              "conversations, one file per conversation, same filenames. Omitted "
@@ -949,6 +1108,27 @@ def main():
     print(f"Found {len(index)} projects, {len(conversations)} conversations",
           file=sys.stderr if args.json else sys.stdout)
 
+    if args.faithful:
+        # Account-level files land once, in the unfiled bucket when there is one, otherwise
+        # beside the first project — they are not project data, so copying them into every
+        # output directory would be duplication rather than completeness.
+        account = load_account_files(zip_path)
+        if account:
+            destinations = [args.unfiled] if args.unfiled else []
+            if not destinations and args.output:
+                destinations = [args.output.split(",")[0].strip()]
+            if destinations:
+                target = Path(destinations[0]) / "raw" / "account"
+                target.mkdir(parents=True, exist_ok=True)
+                for name, blob in account.items():
+                    (target / name).write_bytes(blob)
+                print(f"Account files -> {target}: {', '.join(sorted(account))}",
+                      file=sys.stderr if args.json else sys.stdout)
+            else:
+                print(f"NOTE: {', '.join(sorted(account))} were not copied — give --output or "
+                      f"--unfiled a directory and they will be. They remain in the export ZIP.",
+                      file=sys.stderr)
+
     unfiled = []
     if mapping:
         unfiled = unfiled_conversations(index, conversations)
@@ -996,28 +1176,31 @@ def main():
 
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
-            stats = extract_or_exit(entry, out_dir, mapping is not None, args.thinking)
+            stats = extract_or_exit(entry, out_dir, mapping is not None,
+                                    args.thinking or args.faithful, args.faithful)
             print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
             print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
-        _extract_unfiled(args.unfiled, unfiled, args.thinking)
+        _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
         return
 
     # Interactive mode
     if interactive_mode(index, show_strategy=mapping is not None,
-                        include_thinking=args.thinking):
-        _extract_unfiled(args.unfiled, unfiled, args.thinking)
+                        include_thinking=args.thinking or args.faithful,
+                        faithful=args.faithful):
+        _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
 
 
-def _extract_unfiled(unfiled_dir, unfiled, include_thinking: bool = False):
+def _extract_unfiled(unfiled_dir, unfiled, include_thinking: bool = False,
+                     faithful: bool = False):
     """Write the unfiled bucket, if one was asked for."""
     if not unfiled_dir:
         return
     out_dir = Path(unfiled_dir)
     print(f"\nExtracting unfiled conversations -> {out_dir}")
-    stats = extract_unfiled(unfiled, out_dir, include_thinking)
+    stats = extract_unfiled(unfiled, out_dir, include_thinking, faithful)
     print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
 

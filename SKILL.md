@@ -85,6 +85,10 @@ Confirm what was saved: doc count, conversation count, output paths.
 - `--thinking` also writes Claude's reasoning to a `thinking/` folder beside `conversations/`,
   one file per conversation under the same filename. Off by default — it was 3.3 MB against
   4.2 MB of reply text on one real export
+- `--faithful` loses nothing: implies `--thinking`, renders tool calls and results, citations,
+  the conversation summary and file names into the transcripts, and writes every source record
+  verbatim to `raw/` (including `users.json`, `memories.json`, `login_history.json`). Use it
+  when the user wants an archive rather than something to read
 - Duplicate docs within a project are automatically deduplicated by filename
 - `PYTHONIOENCODING=utf-8` is required on Windows to avoid emoji encoding errors
 - Pass `all` numbers to `--extract` for a full dump

@@ -125,7 +125,8 @@ PROJECTS = [
 ]
 
 
-def _msg(uuid, sender, text, created_at, attachments=None, blocks=False, thinking=None):
+def _msg(uuid, sender, text, created_at, attachments=None, blocks=False, thinking=None,
+         summaries=None, tools=False, cite=False, files=None):
     msg = {
         "uuid": uuid,
         "sender": sender,
@@ -139,6 +140,8 @@ def _msg(uuid, sender, text, created_at, attachments=None, blocks=False, thinkin
         msg["text"] = ""
     else:
         msg["content"] = text
+    if files:
+        msg["files"] = files
     if thinking is not None:
         # Reasoning rides alongside the reply. `thinking` here is a list so a message can
         # carry several blocks, and an empty one — which real exports contain by the
@@ -147,7 +150,28 @@ def _msg(uuid, sender, text, created_at, attachments=None, blocks=False, thinkin
                           else list(msg["content"]))
         msg["content"] = [b if isinstance(b, dict) else {"type": "text", "text": b}
                           for b in msg["content"]]
-        msg["content"] = [{"type": "thinking", "thinking": t} for t in thinking] + msg["content"]
+        blocks_out = []
+        for t in thinking:
+            block = {"type": "thinking", "thinking": t}
+            if summaries:
+                block["summaries"] = [{"summary": x} for x in summaries]
+            blocks_out.append(block)
+        msg["content"] = blocks_out + msg["content"]
+    if cite:
+        for b in msg["content"]:
+            if isinstance(b, dict) and b.get("type") == "text":
+                b["citations"] = [{"title": "Example Source", "url": "https://example.invalid/a"}]
+                break
+    if tools:
+        # A successful call and a failed one: the transcript should show both, and say which
+        # failed, where today it shows neither.
+        msg["content"] = list(msg["content"]) + [
+            {"type": "tool_use", "name": "search_docs", "id": "t-1",
+             "input": {"query": "rubric"}, "message": "Searching the project files"},
+            {"type": "tool_result", "name": "search_docs", "tool_use_id": "t-1",
+             "is_error": True, "message": "no matching documents",
+             "display_content": "0 results"},
+        ]
     return msg
 
 
@@ -166,6 +190,7 @@ CONVERSATIONS = [
     },
     {
         "uuid": C2,
+        "summary": "SUMMARY OF THIS CHAT: the rubric was tightened.",
         "name": "2700 grading rubric revisions",
         "created_at": "2025-11-09T11:00:00Z",
         "updated_at": "2025-11-09T11:45:00Z",
@@ -178,7 +203,9 @@ CONVERSATIONS = [
                                           "This attachment is long enough to be saved to disk.\n",
                  }]),
             _msg("m2-2", "assistant", "Revised rubric attached below.", "2025-11-09T11:02:00Z",
-                 thinking=["REASONING TWO: tighten the evidence criterion."]),
+                 thinking=["REASONING TWO: tighten the evidence criterion."],
+                 summaries=["CONDENSED REASONING: tightened the criterion."],
+                 tools=True, cite=True, files=[{"file_name": "diagram.png", "file_uuid": "f-1"}]),
         ],
     },
     {
