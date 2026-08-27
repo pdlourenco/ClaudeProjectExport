@@ -82,6 +82,9 @@ Confirm what was saved: doc count, conversation count, output paths.
   `--json` output gains a `strategy` field per project: `exact`, `fuzzy`, or `none`
 - With `--mapping`, `--unfiled <dir>` also saves conversations that belong to no project (or to
   a project the user has since deleted — the export cannot tell these apart)
+- `--thinking` also writes Claude's reasoning to a `thinking/` folder beside `conversations/`,
+  one file per conversation under the same filename. Off by default — it was 3.3 MB against
+  4.2 MB of reply text on one real export
 - Duplicate docs within a project are automatically deduplicated by filename
 - `PYTHONIOENCODING=utf-8` is required on Windows to avoid emoji encoding errors
 - Pass `all` numbers to `--extract` for a full dump

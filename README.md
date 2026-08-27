@@ -130,10 +130,12 @@ Each extracted project creates this organized layout:
 │   ├── api-spec.yaml             #   (identical copies deduplicated; same name but
 │   │                             #    different content is kept as api-spec_1.yaml)
 │   └── notes.md                  #   (original filenames preserved)
-└── conversations/
-    ├── Building the API client.md         # Related conversations as readable markdown
-    ├── Debugging auth flow.md             #   (matched by project name keywords)
-    └── Architecture review.md
+├── conversations/
+│   ├── Building the API client.md         # Related conversations as readable markdown
+│   ├── Debugging auth flow.md             #   (matched by project name keywords)
+│   └── Architecture review.md
+└── thinking/                              # only with --thinking; same filenames as above
+    └── Building the API client.md
 ```
 
 With `--mapping`, you can also ask for the conversations that belong to no project at all —
@@ -327,11 +329,33 @@ Currently the tool focuses on project-based extraction. For a full dump of all c
 
 ### Does the output include Claude's thinking?
 
-No. Conversations in recent exports contain `thinking` blocks alongside the reply text, and
-this tool extracts only the reply. On one real export that was 3.3 million characters of
-thinking left out, against 4.2 million characters of text kept — so if you are archiving a
-project for the reasoning rather than the answers, be aware that most of the reasoning is not
-in the output.
+Not by default — pass `--thinking` and it will:
+
+```bash
+python claude_export_extractor.py export.zip --thinking
+```
+
+Conversations in recent exports carry `thinking` blocks alongside the reply text, and the
+transcript holds only the reply. On one real export that was 3.3 million characters of
+reasoning against 4.2 million of reply — worth having if you are archiving a project for how
+something was worked out, and worth leaving out if you are not, which is why it is a flag.
+
+`--thinking` writes a `thinking/` folder beside `conversations/`, one file per conversation,
+**under the same filename as the transcript**:
+
+```
+<output_dir>/
+├── conversations/
+│   ├── Weekly sync.md
+│   └── Weekly sync_1.md
+└── thinking/
+    ├── Weekly sync.md          # reasoning for the transcript of the same name
+    └── Weekly sync_1.md
+```
+
+Conversations that carry no reasoning simply have no file — on that same export, 40 of 78
+unfiled conversations had any. Blocks that are empty, or whose text the export withheld, are
+skipped rather than written as empty sections.
 
 ### Does this work with Claude.ai Team/Enterprise exports?
 

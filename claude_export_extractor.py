@@ -417,7 +417,8 @@ def _project_keywords(project_name: str) -> list:
 
 # ── Extraction ────────────────────────────────────────────────────────────────
 
-def extract_project(entry, output_dir: Path, record_strategy: bool = False):
+def extract_project(entry, output_dir: Path, record_strategy: bool = False,
+                    include_thinking: bool = False):
     """Extract a single project's docs and conversations to the output directory.
 
     record_strategy notes in the saved metadata how the conversations were matched. It is
@@ -479,19 +480,26 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False):
         conv_names = NameAllocator(conv_dir)
 
         for conv in entry["matched_conversations"]:
-            stats["convs_msgs"] += write_conversation(conv, conv_names, docs_dir)
+            stats["convs_msgs"] += write_conversation(
+                conv, conv_names, docs_dir,
+                thinking_dir=(output_dir / "thinking") if include_thinking else None)
             stats["conversations"] += 1
 
     return stats
 
 
-def write_conversation(conv, names: NameAllocator, attach_dir: Path) -> int:
+def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_dir=None) -> int:
     """Write one conversation as markdown, via `names`; return its message count.
 
     Text content from attachments is written alongside, into attach_dir. The allocator is
     passed in rather than built here so that a whole directory's worth of conversations
     shares one — conversations sharing a title need to see each other's names, and a
     directory left over from an earlier run needs to be refreshed rather than duplicated.
+
+    When thinking_dir is given, any reasoning the conversation carries is written there
+    under the *same* filename the transcript received. Deliberately not a name of its own:
+    two conversations called "Untitled" are disambiguated once, by the allocator, and both
+    files inherit that answer — so a transcript and its reasoning always share a name.
     """
     title = conv.get("name") or "Untitled"
     conv_id = conv.get("uuid", "unknown")
@@ -508,11 +516,20 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path) -> int:
         "---\n",
     ]
 
+    thinking_lines = []
     for msg in messages:
         role = (msg.get("sender") or msg.get("role") or "unknown").upper()
         msg_ts = ts(msg.get("created_at", ""))
 
         content = _extract_message_content(msg)
+
+        if thinking_dir is not None:
+            reasoning = _extract_thinking(msg)
+            if reasoning:
+                thinking_lines.append(f"### {role}  _{msg_ts}_\n")
+                thinking_lines.append(reasoning)
+                thinking_lines.append("")
+                thinking_lines.append("---\n")
 
         attachments = msg.get("attachments") or msg.get("files") or []
         attach_notes = []
@@ -543,6 +560,22 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path) -> int:
 
     out_path = names.allocate(safe_name(title) + ".md")
     out_path.write_text("\n".join(lines), encoding="utf-8", errors="backslashreplace")
+
+    if thinking_lines:
+        header = [
+            f"# {title} — reasoning\n",
+            f"- **ID:** {conv_id}",
+            f"- **Created:** {created}",
+            f"- **Transcript:** {out_path.name}\n",
+            "Claude's internal reasoning for this conversation. The sections below line up",
+            "with the assistant messages in the transcript; messages that carried no",
+            "reasoning, or whose reasoning was withheld, are absent rather than empty.\n",
+            "---\n",
+        ]
+        thinking_dir.mkdir(parents=True, exist_ok=True)
+        (thinking_dir / out_path.name).write_text(
+            "\n".join(header + thinking_lines), encoding="utf-8", errors="backslashreplace")
+
     return len(messages)
 
 
@@ -587,17 +620,44 @@ def strategy_counts(index):
     }
 
 
-def extract_unfiled(conversations, output_dir: Path):
+def extract_unfiled(conversations, output_dir: Path, include_thinking: bool = False):
     """Write every unfiled conversation into a single bucket directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stats = {"conversations": 0, "convs_msgs": 0}
     names = NameAllocator(output_dir)
     for conv in conversations:
-        stats["convs_msgs"] += write_conversation(conv, names, output_dir / "attachments")
+        stats["convs_msgs"] += write_conversation(
+            conv, names, output_dir / "attachments",
+            thinking_dir=(output_dir / "thinking") if include_thinking else None)
         stats["conversations"] += 1
 
     return stats
+
+
+def _extract_thinking(msg) -> str:
+    """Return the reasoning text a message carries, or "" if it carries none.
+
+    Recent exports interleave `thinking` blocks with the reply text. The transcript writer
+    ignores them, so on one real export 3.3M characters of reasoning — against 4.2M of
+    reply — never reached the output at all. A block can be present but empty, or marked
+    hidden with its text withheld; neither is worth a section of its own, so both are
+    dropped here rather than producing an empty heading.
+    """
+    raw = msg.get("content")
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return ""
+
+    parts = []
+    for block in raw:
+        if not isinstance(block, dict) or block.get("type") != "thinking":
+            continue
+        text = (block.get("thinking") or "").strip()
+        if text:
+            parts.append(text)
+    return "\n\n---\n\n".join(parts)
 
 
 def _extract_message_content(msg) -> str:
@@ -729,16 +789,17 @@ def assert_distinct_dirs(plan):
         by_dir[resolved] = entry
 
 
-def extract_or_exit(entry, out_dir: Path, record_strategy: bool = False):
+def extract_or_exit(entry, out_dir: Path, record_strategy: bool = False,
+                    include_thinking: bool = False):
     """Extract one project, turning filesystem refusals into a one-line error."""
     try:
-        return extract_project(entry, out_dir, record_strategy)
+        return extract_project(entry, out_dir, record_strategy, include_thinking)
     except OSError as exc:
         print(f"ERROR: Cannot write to {out_dir}: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
-def interactive_mode(index, show_strategy: bool = False):
+def interactive_mode(index, show_strategy: bool = False, include_thinking: bool = False):
     """Run interactive project selection and extraction."""
     print_project_list(index, show_strategy)
 
@@ -792,7 +853,7 @@ def interactive_mode(index, show_strategy: bool = False):
     # Extract
     for entry, out_dir in extractions:
         print(f"\nExtracting: {entry['name']} -> {out_dir}")
-        stats = extract_or_exit(entry, out_dir, show_strategy)
+        stats = extract_or_exit(entry, out_dir, show_strategy, include_thinking)
         print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
         print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
@@ -819,6 +880,11 @@ def main():
     parser.add_argument("--fuzzy", action="store_true",
                         help="Fall back to keyword matching for projects the mapping does not "
                              "cover. Without --mapping, keyword matching is used regardless.")
+    parser.add_argument("--thinking", action="store_true",
+                        help="Also write Claude's reasoning to a thinking/ folder beside the "
+                             "conversations, one file per conversation, same filenames. Omitted "
+                             "by default: on one real export it was 3.3 MB against 4.2 MB of "
+                             "reply text.")
     parser.add_argument("--unfiled", type=str, default=None, metavar="DIR",
                         help="Also write conversations that belong to no project into DIR, "
                              "e.g. ./_unfiled. Requires --mapping.")
@@ -930,27 +996,28 @@ def main():
 
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
-            stats = extract_or_exit(entry, out_dir, mapping is not None)
+            stats = extract_or_exit(entry, out_dir, mapping is not None, args.thinking)
             print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
             print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
-        _extract_unfiled(args.unfiled, unfiled)
+        _extract_unfiled(args.unfiled, unfiled, args.thinking)
         print("\nDone!")
         return
 
     # Interactive mode
-    if interactive_mode(index, show_strategy=mapping is not None):
-        _extract_unfiled(args.unfiled, unfiled)
+    if interactive_mode(index, show_strategy=mapping is not None,
+                        include_thinking=args.thinking):
+        _extract_unfiled(args.unfiled, unfiled, args.thinking)
         print("\nDone!")
 
 
-def _extract_unfiled(unfiled_dir, unfiled):
+def _extract_unfiled(unfiled_dir, unfiled, include_thinking: bool = False):
     """Write the unfiled bucket, if one was asked for."""
     if not unfiled_dir:
         return
     out_dir = Path(unfiled_dir)
     print(f"\nExtracting unfiled conversations -> {out_dir}")
-    stats = extract_unfiled(unfiled, out_dir)
+    stats = extract_unfiled(unfiled, out_dir, include_thinking)
     print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
 
 
