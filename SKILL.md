@@ -24,12 +24,22 @@ used as context for Claude Code work.
 ```
 <output_dir>/
   project_knowledge/          # Knowledge docs, attachments, prompt template
-    _project_metadata.json    # Project name, UUID, dates, counts
+    _project_metadata.json    # Name, UUID, dates, counts, and how conversations were matched
     _prompt_template.md       # Project custom instructions (if any)
-    <knowledge files>...      # All uploaded docs, deduplicated
+    <knowledge files>...      # All uploaded docs
   conversations/              # Related conversation history as markdown
     <conversation>.md ...     # One file per conversation
+  thinking/                   # Only with --thinking or --faithful; same filenames as above
+  raw/                        # Only with --faithful; the source records, verbatim
 ```
+
+## The one thing to get right
+
+The export format carries **no link between a conversation and its project**. Left to itself the
+extractor guesses from name similarity, and on a measured real export that reached 41 of 234
+conversations — with false positives among them. A mapping file fetched from the user's browser
+raises that to 156, exactly. So Step 2 is not optional politeness: skipping it means handing the
+user a worse result than the tool is capable of, without telling them.
 
 ## Workflow
 
@@ -42,53 +52,99 @@ Ask the user for the path to their Claude.ai export ZIP file. Common locations:
 
 Verify the file exists before proceeding.
 
-### Step 2: List projects
+### Step 2: Offer exact conversation matching
 
-Run the extractor in JSON mode to get a machine-readable project list:
+Ask whether the user can open [claude.ai](https://claude.ai) in a signed-in browser.
+
+**If yes**, walk them through it:
+
+1. Read `~/.claude/skills/ClaudeProjectExport/fetch_mapping.js` and give them its contents to
+   paste — they need the text, not a path they'd have to go find. If that file isn't there,
+   the install predates it: ask them to re-run the `cp` line from the repo's README, which now
+   copies it too.
+2. They open DevTools (`F12`, or `Cmd-Opt-I` on macOS) → **Console** on a claude.ai tab. On
+   Firefox the first paste is blocked: they press `Ctrl+V`, type `allow pasting`, press Enter,
+   then paste again.
+3. It downloads `mapping.json`. Ask them for the path.
+4. Pass `--mapping "<path>"` on **every** extractor command from here on.
+
+Two things worth saying while they wait:
+
+- If they have not yet requested the data export, they should request it *first* and fetch the
+  mapping while waiting for the email. The export is a snapshot taken at request time, so a
+  mapping fetched afterwards covers everything in it.
+- The script's endpoints are Claude.ai's internal ones — undocumented and unversioned. If it
+  fails it prints every endpoint it tried; relay that rather than guessing.
+
+**If no**, carry on without it, and say plainly that conversations will be matched by guessing
+from their titles, so some will be missed and some misfiled.
+
+### Step 3: List projects
 
 ```bash
-PYTHONIOENCODING=utf-8 python ~/.claude/skills/ClaudeProjectExport/claude_export_extractor.py "<zip_path>" --json
+PYTHONIOENCODING=utf-8 python ~/.claude/skills/ClaudeProjectExport/claude_export_extractor.py "<zip_path>" [--mapping "<path>"] --json
 ```
 
-This returns a JSON array with each project's name, doc count, conversation count, and size.
+Returns each project's name, doc count, conversation count, and size. With `--mapping` each entry
+also carries `strategy`:
 
-### Step 3: Present projects to the user
+| `strategy` | meaning |
+|---|---|
+| `exact` | conversations joined by UUID — nothing guessed |
+| `fuzzy` | guessed from the project name; only appears if you passed `--fuzzy` |
+| `none` | the mapping doesn't cover this project, so nothing was attached |
 
-Show the projects in a clean table format. Ask which projects to extract.
+A `none` usually means the project was deleted from claude.ai after the export was taken. Say so
+rather than presenting it as an empty project.
 
-### Step 4: Get output directories
+With `--mapping` the run also prints a reconciliation line — *N filed by UUID, N guessed, N
+unfiled* — which always sums to the total. Worth relaying: it is the user's evidence that
+nothing vanished.
 
-For each selected project, ask where to save the output. Suggest a sensible default based on
-the project name and current working directory.
+### Step 4: Present projects to the user
 
-### Step 5: Extract
+Show the projects in a clean table. Include the match strategy when a mapping is in play. Ask
+which to extract.
 
-Run the extractor in non-interactive mode:
+If the reconciliation line shows a meaningful number of unfiled conversations, offer
+`--unfiled <dir>`: *"N conversations belong to no project — save those too?"* They are either
+standalone chats or from deleted projects, and nothing in the export can tell those apart.
+
+### Step 5: Get output directories
+
+For each selected project, ask where to save the output. Suggest a sensible default based on the
+project name and current working directory.
+
+### Step 6: Extract
 
 ```bash
-PYTHONIOENCODING=utf-8 python ~/.claude/skills/ClaudeProjectExport/claude_export_extractor.py "<zip_path>" --extract <nums> --output "<dir1>,<dir2>"
+PYTHONIOENCODING=utf-8 python ~/.claude/skills/ClaudeProjectExport/claude_export_extractor.py "<zip_path>" [--mapping "<path>"] --extract <nums> --output "<dir1>,<dir2>" [--unfiled <dir>]
 ```
 
-### Step 6: Report results
+Two more flags worth offering rather than assuming:
 
-Confirm what was saved: doc count, conversation count, output paths.
+- `--thinking` — also writes Claude's reasoning to `thinking/`. It was 3.3 MB against 4.2 MB of
+  reply text on a measured export, so ask rather than deciding for them.
+- `--faithful` — for archiving rather than reading. Implies `--thinking`, adds tool calls and
+  their results, citations, the conversation's summary and file names to the transcripts, and
+  writes every source record verbatim to `raw/`, so nothing in the export is lost.
+
+### Step 7: Report results
+
+Confirm what was saved: doc count, conversation count, output paths, and — when a mapping was
+used — how many conversations were filed exactly versus left unfiled.
 
 ## Notes
 
-- Conversations are matched to projects by keyword similarity, because the export format carries
-  no project-to-conversation link. If the user can run `fetch_mapping.js` in a signed-in browser
-  (see README), pass the resulting file with `--mapping <path>` for an exact UUID join; add
-  `--fuzzy` to let projects the mapping misses fall back to keyword matching. With `--mapping`,
-  `--json` output gains a `strategy` field per project: `exact`, `fuzzy`, or `none`
-- With `--mapping`, `--unfiled <dir>` also saves conversations that belong to no project (or to
-  a project the user has since deleted — the export cannot tell these apart)
-- `--thinking` also writes Claude's reasoning to a `thinking/` folder beside `conversations/`,
-  one file per conversation under the same filename. Off by default — it was 3.3 MB against
-  4.2 MB of reply text on one real export
-- `--faithful` loses nothing: implies `--thinking`, renders tool calls and results, citations,
-  the conversation summary and file names into the transcripts, and writes every source record
-  verbatim to `raw/` (including `users.json`, `memories.json`, `login_history.json`). Use it
-  when the user wants an archive rather than something to read
-- Duplicate docs within a project are automatically deduplicated by filename
+- Re-running an extraction into the same directory is safe: it refreshes files in place rather
+  than duplicating or versioning them
+- `_project_metadata.json` records `conversation_match` (`exact` / `fuzzy` / `none`) when a
+  mapping was used, so the output folder documents how it was built
+- Identical duplicate docs are dropped; two different docs that happen to share a filename are
+  both kept, disambiguated as `notes.txt` and `notes_1.txt`. Nothing is silently overwritten
+- Without `--thinking` or `--faithful`, Claude's reasoning is not extracted — about 44% of the
+  message text on a measured export. Set that expectation if the user goes looking for it
+- Errors are one-line messages on stderr with exit status 1. Relay them verbatim; they name the
+  problem
 - `PYTHONIOENCODING=utf-8` is required on Windows to avoid emoji encoding errors
 - Pass `all` numbers to `--extract` for a full dump
