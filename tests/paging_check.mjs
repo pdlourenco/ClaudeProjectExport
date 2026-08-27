@@ -37,7 +37,8 @@ const SCENARIOS = [
   { name: "cursor in a pagination envelope", mapped: FILED, warns: false, envelope: true },
   { name: "offset ignored",                  mapped: 66,    warns: true,  ignoreOffset: true },
   { name: "capped below limit, offset ignored", mapped: 16, warns: true,  cap: 25, ignoreOffset: true },  // 25 fetched, 16 of them filed
-  { name: "HTTP 429 partway through",        mapped: 133,   warns: true,  failOn: 3 },
+  { name: "HTTP 429, transient",             mapped: FILED, warns: false, failOnce: 3 },
+  { name: "HTTP 429, persistent",            mapped: 133,   warns: true,  failOn: 3 },
 ];
 
 function mockFetch(s) {
@@ -49,7 +50,10 @@ function mockFetch(s) {
     if (!path.includes("chat_conversations")) return { ok: false, status: 404, json: async () => ({}) };
 
     listingCalls += 1;
+    // failOn: dies from that request onward, so the retry fails too and the run must warn.
+    // failOnce: one bad response, which the retry should absorb without a word.
     if (s.failOn && listingCalls >= s.failOn) return { ok: false, status: 429, json: async () => ({}) };
+    if (s.failOnce && listingCalls === s.failOnce) return { ok: false, status: 429, json: async () => ({}) };
 
     const url = new URL("https://x" + path);
     const cap = s.cap || Number(url.searchParams.get("limit"));
