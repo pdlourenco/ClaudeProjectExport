@@ -146,6 +146,30 @@ class NameAllocator:
 
 # ── Data loading ──────────────────────────────────────────────────────────────
 
+def classify_entry(name: str) -> str:
+    """Say what an archive entry is: "project", "conversation", "account", or "" for neither.
+
+    Judged on the file's own name and the directory holding it, never on the whole path.
+    Substring-matching the path reads as harmless until an export nests everything under a
+    folder called conversations-with-claude, at which point every entry in the archive —
+    project files included — matches "conversation" and the classification collapses.
+    """
+    lowered = name.lower()
+    if not lowered.endswith(".json"):
+        return ""
+    parts = [part for part in lowered.replace("\\", "/").split("/") if part]
+    if not parts:
+        return ""
+    base = parts[-1]
+    parent = parts[-2] if len(parts) > 1 else ""
+
+    if parent == "projects" or base.startswith("project"):
+        return "project"
+    if parent == "conversations" or base.startswith("conversation"):
+        return "conversation"
+    return "account"
+
+
 def load_export(zip_path: Path):
     """Load projects and conversations from the export ZIP.
 
@@ -157,30 +181,47 @@ def load_export(zip_path: Path):
     with zipfile.ZipFile(zip_path, "r") as zf:
         names = zf.namelist()
 
-        proj_files = sorted(n for n in names if "project" in n.lower() and n.endswith(".json"))
-        conv_file = next((n for n in names if "conversation" in n.lower() and n.endswith(".json")), None)
+        proj_files = sorted(n for n in names if classify_entry(n) == "project")
+        conv_files = sorted(n for n in names if classify_entry(n) == "conversation")
 
         projects = []
         for proj_file in proj_files:
             projects.extend(_as_projects(json.loads(zf.read(proj_file))))
 
-        conversations = json.loads(zf.read(conv_file)) if conv_file else []
+        # Every conversation file, for the same reason every project file is read: taking
+        # the first match is how a per-file layout silently yields one record. Exports have
+        # already moved projects that way once.
+        conversations = []
+        for conv_file in conv_files:
+            conversations.extend(_as_conversations(json.loads(zf.read(conv_file))))
 
-    if isinstance(conversations, dict):
-        conversations = conversations.get("conversations", conversations.get("data", []))
+    return _dedup_by_uuid(projects), _dedup_by_uuid(conversations)
 
-    # An archive could carry both layouts; keep the first record for each UUID.
+
+def _dedup_by_uuid(records):
+    """Keep the first record for each UUID; an archive could carry two layouts at once."""
     seen = set()
-    unique_projects = []
-    for proj in projects:
-        uuid = proj.get("uuid")
+    unique = []
+    for record in records:
+        uuid = record.get("uuid")
         if uuid:
             if uuid in seen:
                 continue
             seen.add(uuid)
-        unique_projects.append(proj)
+        unique.append(record)
+    return unique
 
-    return unique_projects, conversations
+
+def _as_conversations(blob):
+    """A conversation file is a list, a wrapper object, or one conversation on its own."""
+    if isinstance(blob, dict):
+        for key in ("conversations", "data"):
+            if isinstance(blob.get(key), list):
+                return [c for c in blob[key] if isinstance(c, dict)]
+        return [blob] if blob.get("uuid") else []
+    if isinstance(blob, list):
+        return [c for c in blob if isinstance(c, dict)]
+    return []
 
 
 def load_account_files(zip_path: Path) -> dict:
@@ -193,14 +234,31 @@ def load_account_files(zip_path: Path) -> dict:
     """
     out = {}
     with zipfile.ZipFile(zip_path, "r") as zf:
-        for name in zf.namelist():
-            if not name.endswith(".json"):
-                continue
-            lowered = name.lower()
-            if "project" in lowered or "conversation" in lowered:
-                continue
-            out[Path(name).name] = zf.read(name)
+        entries = sorted(name for name in zf.namelist()
+                         if classify_entry(name) == "account" and _path_segments(name))
+        # Two account files can share a base name in different folders. Keying on the base
+        # name alone collapses them into one and lets the archive's entry order pick the
+        # survivor — the property this file no longer allows anywhere else. So a name is
+        # qualified by its folder exactly when it needs to be, decided by counting first
+        # rather than by who arrives second, and users.json stays users.json.
+        shared = defaultdict(int)
+        for name in entries:
+            shared[_path_segments(name)[-1]] += 1
+        for name in entries:
+            parts = _path_segments(name)
+            key = parts[-1]
+            if shared[key] > 1:
+                key = "/".join(parts[-2:])
+            while key in out:
+                key = "/".join(parts)
+            out[key] = zf.read(name)
     return out
+
+
+def _path_segments(name: str) -> list:
+    """A path's segments, with "." and ".." dropped so a key can never climb out."""
+    return [part for part in str(name).replace("\\", "/").split("/")
+            if part and part not in (".", "..")]
 
 
 def _as_projects(blob):
@@ -1507,7 +1565,14 @@ def copy_account_files(zip_path: Path, destination: Path):
     target = Path(destination) / "raw" / "account"
     target.mkdir(parents=True, exist_ok=True)
     for name, blob in account.items():
-        (target / name).write_bytes(blob)
+        # Segments are sanitized on the way out as well as on the way in: the key came
+        # from an archive, and an archive is not a trustworthy source of file paths.
+        segments = [safe_name(part) for part in _path_segments(name)]
+        out_path = target.joinpath(*segments) if segments else None
+        if out_path is None:
+            continue
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(blob)
     print(f"\nAccount files -> {target}")
     print(f"  {', '.join(sorted(account))}")
 

@@ -45,11 +45,19 @@ That's it. No `pip install`, no virtual environment, no config file.
 | `conversations.json` | All your chat history (every conversation you've had) |
 | `projects/<uuid>.json` | One file per project — knowledge docs and prompt template |
 | `projects.json` | Older exports instead ship a single file holding every project |
-| `memories.json` | Saved memories |
+| `memories.json`, or `memories/<uuid>.json` | Saved memories |
 | `users.json` | Account info |
 | `login_history.json` | Sign-in history (not used by this tool) |
 
-Both project layouts are read, so it doesn't matter which one your export uses.
+Both project layouts are read, so it doesn't matter which one your export uses. The same goes
+for a per-conversation `conversations/<uuid>.json` layout, should exports move that way as they
+already did for projects.
+
+Recent exports arrive as several archives that you may collate into one, nested under a folder
+such as `conversations-with-claude/unprocessed/`. That is read too. Entries are classified by
+their own filename and the directory holding them, never by matching the whole path — a folder
+whose name happens to contain "conversation" would otherwise make every file in the archive,
+project files included, look like the conversation list.
 
 ## Usage
 
@@ -484,7 +492,7 @@ folder would be duplication rather than completeness.
 
 ### Does this work with Claude.ai Team/Enterprise exports?
 
-It should work with any Claude.ai data export that follows the standard format (`conversations.json`, `projects.json`). The schema is auto-detected.
+It should work with any Claude.ai data export that follows the standard format (`conversations.json`, `projects.json` or `projects/<uuid>.json`), including one nested inside a containing folder. The layout is auto-detected, and the archive's own entry order does not affect what gets read.
 
 ## Contributing
 
