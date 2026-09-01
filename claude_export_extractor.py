@@ -571,7 +571,6 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
     summary = (conv.get("summary") or "").strip() if faithful else ""
     if summary:
         lines.append(f"> {summary}\n")
-    lines.append("---\n")
 
     # The transcript's name is claimed before its body is built, because the files this
     # conversation produced are filed under that name and the markers pointing at them are
@@ -582,16 +581,29 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
     # Replayed up front: a marker sits at the message that wrote the file, but what it
     # has to say — whether the replay stayed consistent to the end — is only known once
     # every later edit has been applied.
-    produced = collect_files(conv) if files_root is not None else {}
+    produced, orphaned = collect_files(conv) if files_root is not None else ({}, {})
     files_folder = out_path.stem
-    if produced:
-        written = write_conversation_files(produced, Path(files_root) / files_folder)
+    if produced or orphaned:
+        written = write_conversation_files(
+            produced, orphaned, Path(files_root) / files_folder)
         if counters is not None:
             counters["files"] = counters.get("files", 0) + written
     by_message = {}
     for record in produced.values():
         if record.get("message") is not None:
             by_message.setdefault(id(record["message"]), []).append(record)
+
+    if orphaned:
+        total = sum(orphaned.values())
+        named = ", ".join(f"{path} ({count})" for path, count in
+                          sorted(orphaned.items(), key=lambda kv: -kv[1])[:5])
+        more = "" if len(orphaned) <= 5 else f", and {len(orphaned) - 5} more"
+        lines.append(
+            f"> [{total} edit{'s' if total != 1 else ''} in this conversation change "
+            f"{len(orphaned)} file{'s' if len(orphaned) != 1 else ''} it never shows being "
+            f"created — {named}{more}. Those files were written outside the recorded tool "
+            f"calls, so they are not reconstructed here.]\n")
+    lines.append("---\n")
 
     thinking_lines = []
     for msg in messages:
@@ -736,9 +748,17 @@ def collect_files(conv) -> dict:
     than guessed at: `complete` is False for such a file and the caller says so, because a
     file that silently claims to be final is worse than one that admits it isn't.
 
-    Returns {key: record}, in the order the files were first written.
+    An edit can also name a file this conversation never shows being created — the shell
+    wrote it, or it is the same document under another path (a working copy edited at
+    /home/claude/x.md, published at /mnt/user-data/outputs/x.md). Those are counted too, and
+    deliberately not resolved by base name: on the export this was built against, that guess
+    would have applied 12 of 25 such edits to the wrong file.
+
+    Returns ({key: record}, {path: edit count}) — the files, and the edits that named a file
+    not among them.
     """
     files = {}
+    orphans = {}
     last_path = None
 
     for msg in conv.get("chat_messages") or conv.get("messages") or []:
@@ -786,13 +806,18 @@ def collect_files(conv) -> dict:
                 target = path if isinstance(path, str) else last_path
                 record = files.get(target)
                 if record is None:
+                    # Nothing to reconstruct, but the edit happened. Counted rather than
+                    # dropped, so the record is uniform: applied, unmatched, or orphaned.
+                    orphans[target or "(unnamed)"] = orphans.get(target or "(unnamed)", 0) + 1
                     continue
                 _apply_edit(record, inp["old_str"], inp["new_str"])
                 last_path = target
 
     for record in files.values():
+        # Per recorded path: every edit keyed to this file's own path applied. An edit that
+        # named the file differently is an orphan, and shows up in that list instead.
         record["complete"] = record["unmatched"] == 0
-    return files
+    return files, orphans
 
 
 def _replay_artifact(files, inp: dict, msg=None):
@@ -829,14 +854,14 @@ def _apply_edit(record, old: str, new: str):
         record["unmatched"] += 1
 
 
-def write_conversation_files(records, directory: Path) -> int:
+def write_conversation_files(records, orphans, directory: Path) -> int:
     """Write the reconstructed files, plus a manifest naming where each came from.
 
     Files are written under their base name, so the manifest carries the full source path
     — two directories in one conversation can hold the same base name, and the allocator
     disambiguates that on disk without recording which was which.
     """
-    if not records:
+    if not records and not orphans:
         return 0
     directory.mkdir(parents=True, exist_ok=True)
     allocator = NameAllocator(directory, reserved=("_manifest.json",))
@@ -855,7 +880,11 @@ def write_conversation_files(records, directory: Path) -> int:
             "complete": record["complete"],
         })
     (directory / "_manifest.json").write_text(
-        json.dumps(manifest, indent=2), encoding="utf-8")
+        json.dumps({
+            "files": manifest,
+            "orphaned_edits": [{"path": path, "edits": count}
+                               for path, count in orphans.items()],
+        }, indent=2), encoding="utf-8")
     return len(manifest)
 
 

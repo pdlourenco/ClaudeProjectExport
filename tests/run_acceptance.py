@@ -391,8 +391,8 @@ def main():
         check("a code artifact is named from its language",
               (fdir / "helper.py").read_text(encoding="utf-8").strip() == "print(1)")
 
-        manifest = {m["file"]: m for m in
-                    json.loads((fdir / "_manifest.json").read_text(encoding="utf-8"))}
+        manifest_doc = json.loads((fdir / "_manifest.json").read_text(encoding="utf-8"))
+        manifest = {m["file"]: m for m in manifest_doc["files"]}
         check("the manifest keeps the source path the base name loses",
               manifest["notes.md"]["source"] == "/mnt/user-data/outputs/notes.md")
         check("a file whose edits all applied is marked complete",
@@ -436,6 +436,68 @@ def main():
         check("--faithful still writes the files and the raw records",
               (ffaith / "files" / "Alpha" / "notes.md").exists()
               and (ffaith / "raw" / "conversations" / "Alpha.json").exists())
+
+        # An edit naming a file the conversation never shows being created — the shell
+        # wrote it, or it is the same document under a second path. Nothing can be
+        # reconstructed, and resolving by base name would be a guess that is wrong about
+        # half the time on real data, so it is counted instead of dropped.
+        orphan = tmp / "orphan_edits.zip"
+        with zipfile.ZipFile(orphan, "w") as zf:
+            zf.writestr("projects.json", json.dumps([{
+                "uuid": "p-1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "description": "", "prompt_template": "", "docs": []}]))
+            zf.writestr("conversations.json", json.dumps([{
+                "uuid": "c1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "chat_messages": [
+                    assistant(1, [tool("str_replace", {"path": "/made/by/bash.md",
+                                                       "old_str": "a", "new_str": "b"}, 1),
+                                  tool("str_replace", {"path": "/made/by/bash.md",
+                                                       "old_str": "c", "new_str": "d"}, 2)]),
+                    # Same document, second path form: created as /repo/a.md, edited as a.md.
+                    assistant(2, [tool("create_file", {"path": "/repo/a.md",
+                                                       "file_text": "hello\n"}, 3),
+                                  tool("str_replace", {"path": "a.md", "old_str": "hello",
+                                                       "new_str": "HELLO"}, 4)]),
+                ]}]))
+        oout = tmp / "orphan_out"
+        run(EXTRACTOR, orphan, "--extract", "1", "--output", oout)
+        odoc = json.loads((oout / "files" / "Alpha" / "_manifest.json").read_text(encoding="utf-8"))
+        counts = {e["path"]: e["edits"] for e in odoc["orphaned_edits"]}
+        check("an edit to a file never created here is counted, not dropped",
+              counts.get("/made/by/bash.md") == 2, f"{counts}")
+        check("the same document under a second path is counted too",
+              counts.get("a.md") == 1, f"{counts}")
+        otrans = (oout / "conversations" / "Alpha.md").read_text(encoding="utf-8")
+        check("the transcript says so, since an orphan edit has no file to mark",
+              "3 edits in this conversation change 2 files it never shows being created" in otrans)
+        check("orphan edits are never applied by guessing at a matching base name",
+              (oout / "files" / "Alpha" / "a.md").read_text(encoding="utf-8") == "hello\n",
+              "resolving by base name would be wrong 12 times in 25 on real data")
+
+        # A conversation with only orphan edits still has to say so somewhere.
+        only = tmp / "only_orphans.zip"
+        with zipfile.ZipFile(only, "w") as zf:
+            zf.writestr("projects.json", json.dumps([{
+                "uuid": "p-1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "description": "", "prompt_template": "", "docs": []}]))
+            zf.writestr("conversations.json", json.dumps([{
+                "uuid": "c1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "chat_messages": [
+                    assistant(1, [tool("str_replace", {"path": "/only/bash.md",
+                                                       "old_str": "a", "new_str": "b"}, 1)]),
+                ]}]))
+        oo = tmp / "only_out"
+        run(EXTRACTOR, only, "--extract", "1", "--output", oo)
+        odoc2 = json.loads((oo / "files" / "Alpha" / "_manifest.json").read_text(encoding="utf-8"))
+        check("a conversation that produced no files still records its orphan edits",
+              odoc2["files"] == [] and odoc2["orphaned_edits"][0]["path"] == "/only/bash.md")
+
+        # And a conversation that touched no files at all gets no folder — the record is
+        # complete without being noisy.
+        quiet = tmp / "quiet_out"
+        run(EXTRACTOR, zip_path, "--extract", "1", "--output", quiet)
+        check("a conversation with no file activity gets no files folder",
+              not (quiet / "files").exists())
 
         # Hostile shapes, each of which reached the disk in an earlier draft of this work.
         hostile = tmp / "hostile_files.zip"

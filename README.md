@@ -388,7 +388,25 @@ Each file also gets a marker in the transcript at the point it was written, so r
 conversation tells you a document exists and where it went.
 
 `_manifest.json` records where each file came from — files are written under their base name,
-so the full source path would otherwise be lost — along with how many edits were replayed.
+so the full source path would otherwise be lost — along with how many edits were replayed, and
+separately any edits that named a file this conversation never shows being created:
+
+```json
+{
+  "files": [
+    {"file": "roadmap.md", "source": "/mnt/user-data/outputs/roadmap.md",
+     "edits_applied": 18, "edits_unmatched": 4, "complete": false}
+  ],
+  "orphaned_edits": [{"path": "/home/claude/SPEC.md", "edits": 18}]
+}
+```
+
+An orphaned edit is one whose file was written outside the recorded calls, or is the same
+document under a second path — a working copy at `/home/claude/x.md` published to
+`/mnt/user-data/outputs/x.md`. Nothing can be reconstructed from it, and matching by base name
+would be a guess: on the measured export that guess would have applied **12 of 25** such edits
+to the wrong file. So they are counted and named instead, in the manifest and once at the top
+of the transcript.
 
 **Replay is only ever as complete as the record.** A file the conversation also changed through
 the shell — a heredoc, `sed`, a script it ran — moves without leaving a tool call to replay, so
@@ -403,7 +421,8 @@ manifest marks the file `"complete": false` and the transcript says so in plain 
 ```
 
 On the export this was built against, 107 files were recovered across 33 conversations —
-1.3 million characters — and 7 were flagged incomplete. All of it was previously dropped:
+1.3 million characters — 7 were flagged incomplete, and 80 orphaned edits were recorded across
+2 conversations. All of it was previously dropped:
 before this, only artifacts reached the output, inlined into the transcript, while every file
 written by `create_file` was silently discarded.
 

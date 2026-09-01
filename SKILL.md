@@ -140,6 +140,8 @@ If the run reported files, mention `files/`: those are the documents Claude wrot
 conversations, rebuilt from the tool calls that produced them. Check each `_manifest.json` for
 any entry with `"complete": false` and say so — that file was also changed outside the recorded
 tool calls, so it is the last state the transcript can account for rather than the final one.
+`orphaned_edits` in the same file lists edits to documents that were never created on record at
+all; those are not reconstructed, and saying which paths they name is more useful than silence.
 
 ## Notes
 
