@@ -160,4 +160,5 @@ all; those are not reconstructed, and saying which paths they name is more usefu
 - Errors are one-line messages on stderr with exit status 1. Relay them verbatim; they name the
   problem
 - `PYTHONIOENCODING=utf-8` is required on Windows to avoid emoji encoding errors
-- Pass `all` numbers to `--extract` for a full dump
+- `--extract all` extracts every project. Omit `--output` with it and each directory is
+  named after its project; giving `--output` means one path per project, in order
