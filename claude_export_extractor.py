@@ -1330,6 +1330,11 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
         return False
 
     if choice.lower() == "all":
+        if not index:
+            # "all" is the one answer that can select nothing: every other path either
+            # names a number that must be in range, or fails to parse.
+            print("This export contains no projects to extract.")
+            return False
         selected = list(range(len(index)))
     else:
         try:
@@ -1378,7 +1383,9 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
             print(f"  {stats['files']} files Claude produced")
 
     # The first directory, so a caller wanting somewhere to put run-level files has one.
-    return extractions[0][1]
+    # Falsy when nothing was extracted, which is what the caller reads as "no output to
+    # put anything beside" — and keeps a future empty selection from indexing into [0].
+    return extractions[0][1] if extractions else False
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1391,7 +1398,8 @@ def main():
     parser.add_argument("--json", action="store_true",
                         help="Print project list as JSON (for automation)")
     parser.add_argument("--extract", type=str, default=None,
-                        help="Comma-separated project numbers to extract (non-interactive)")
+                        help="Comma-separated project numbers to extract, or 'all' "
+                             "(non-interactive)")
     parser.add_argument("--output", type=str, default=None,
                         help="Comma-separated output directories (one per project)")
     parser.add_argument("--mapping", type=str, default=None,
@@ -1497,17 +1505,30 @@ def main():
         if not args.extract.strip():
             print("ERROR: --extract needs at least one project number", file=sys.stderr)
             sys.exit(1)
-        try:
-            nums = [int(x.strip()) - 1 for x in args.extract.split(",")]
-        except ValueError:
-            print(f"ERROR: --extract takes comma-separated project numbers, got: "
-                  f"{args.extract!r}", file=sys.stderr)
-            sys.exit(1)
+        if args.extract.strip().lower() == "all":
+            # Interactive mode has always taken "all" at its prompt, and says so. Rejecting
+            # it here made the same word mean "everything" in one half of the tool and an
+            # error in the other.
+            nums = list(range(len(index)))
+            if not nums:
+                print("ERROR: --extract all: the export contains no projects", file=sys.stderr)
+                sys.exit(1)
+        else:
+            try:
+                nums = [int(x.strip()) - 1 for x in args.extract.split(",")]
+            except ValueError:
+                print(f"ERROR: --extract takes comma-separated project numbers, or 'all', "
+                      f"got: {args.extract!r}", file=sys.stderr)
+                sys.exit(1)
 
         dirs = args.output.split(",") if args.output else [None] * len(nums)
 
         if len(dirs) != len(nums):
-            print("ERROR: --output must have the same number of paths as --extract", file=sys.stderr)
+            # With "all" the count is the export's, not something the user typed, so say
+            # what it is rather than leaving them to count projects themselves.
+            print(f"ERROR: --output must have the same number of paths as --extract "
+                  f"({len(dirs)} given, {len(nums)} needed). Omit --output to name the "
+                  f"directories after the projects.", file=sys.stderr)
             sys.exit(1)
 
         plan = []

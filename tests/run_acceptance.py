@@ -235,6 +235,72 @@ def main():
         check("exactly-joined project is marked too",
               meta_exact.get("conversation_match") == "exact")
 
+        # ── --extract all ────────────────────────────────────────────────────
+        # Interactive mode has always accepted "all" at its prompt. The CLI rejecting it
+        # made one word mean "everything" in half the tool and an error in the other.
+        print("\n--extract all")
+        all_out = tmp / "all_out"
+        all_proc = run(EXTRACTOR, zip_path, "--extract", "all", "--output",
+                       ",".join(str(all_out / f"p{i}") for i in range(1, 5)))
+        check("--extract all takes every project",
+              sorted(d.name for d in all_out.iterdir()) == ["p1", "p2", "p3", "p4"],
+              f"{sorted(d.name for d in all_out.iterdir()) if all_out.exists() else None}")
+        numbered = run(EXTRACTOR, zip_path, "--extract", "1,2,3,4", "--output",
+                       ",".join(str(tmp / "num_out" / f"p{i}") for i in range(1, 5)))
+        check("it means exactly what listing every number means",
+              normalise(all_proc.stdout, all_out) == normalise(numbered.stdout, tmp / "num_out"))
+
+        # Without --output the directories are named after the projects, which is the only
+        # way "all" is usable on an export whose project count you don't already know.
+        derived = tmp / "derived"
+        derived.mkdir()
+        # Run from inside an empty directory, since without --output the tool derives the
+        # names relative to the working directory.
+        subprocess.run([sys.executable, str(EXTRACTOR), str(zip_path), "--extract", "all"],
+                       capture_output=True, text=True, cwd=derived, check=True)
+        check("--extract all without --output names directories after the projects",
+              sorted(d.name for d in derived.iterdir()) ==
+              sorted(e["name"].strip() or "Untitled" for e in index_json(zip_path)),
+              str(sorted(d.name for d in derived.iterdir())))
+
+        for variant in ("ALL", "  all  "):
+            v_out = tmp / f"all_{variant.strip().lower()}_{len(variant)}"
+            run(EXTRACTOR, zip_path, "--extract", variant, "--output",
+                ",".join(str(v_out / f"p{i}") for i in range(1, 5)))
+            check(f"--extract {variant!r} is accepted like 'all'",
+                  len(list(v_out.iterdir())) == 4)
+
+        mismatch = run(EXTRACTOR, zip_path, "--extract", "all", "--output", "a,b", expect_rc=1)
+        check("a wrong --output count says how many the export needs",
+              "2 given, 4 needed" in mismatch.stderr and "Omit --output" in mismatch.stderr,
+              mismatch.stderr.strip().splitlines()[-1][:90])
+        nonsense = run(EXTRACTOR, zip_path, "--extract", "nonsense", expect_rc=1)
+        check("the error for a bad value now mentions 'all'",
+              "or 'all'" in nonsense.stderr and "Traceback" not in nonsense.stderr,
+              nonsense.stderr.strip().splitlines()[-1][:90])
+
+        empty_zip = tmp / "no_projects.zip"
+        with zipfile.ZipFile(empty_zip, "w") as zf:
+            zf.writestr("projects.json", json.dumps([]))
+            zf.writestr("conversations.json", json.dumps([]))
+        none_proc = run(EXTRACTOR, empty_zip, "--extract", "all", expect_rc=1)
+        check("--extract all on an export with no projects fails cleanly",
+              none_proc.stderr.startswith("ERROR: ") and "Traceback" not in none_proc.stderr,
+              none_proc.stderr.strip().splitlines()[-1][:90])
+
+        # The interactive twin of the same edge. "all" is the one answer that can select
+        # nothing — every other path names a number that must be in range, or fails to
+        # parse — and selecting nothing used to index into an empty extraction list.
+        interactive_none = run(EXTRACTOR, empty_zip, stdin="all\nY\n")
+        check("interactive 'all' on an export with no projects says so instead of crashing",
+              "no projects to extract" in interactive_none.stdout
+              and "Traceback" not in interactive_none.stderr,
+              interactive_none.stderr.strip().splitlines()[-1][:70] if interactive_none.stderr.strip() else "clean")
+        faithful_none = run(EXTRACTOR, empty_zip, "--faithful", stdin="all\nY\n")
+        check("...and --faithful does not then try to place account files",
+              "Traceback" not in faithful_none.stderr
+              and "Account files" not in faithful_none.stdout)
+
         # ── Error handling ───────────────────────────────────────────────────
         print("\nError handling")
         bad = tmp / "bad"

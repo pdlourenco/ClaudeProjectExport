@@ -88,6 +88,9 @@ Then choose output directories for each, confirm, and extract.
 ```bash
 # Extract projects 1 and 3 to specific directories
 python claude_export_extractor.py export.zip --extract 1,3 --output "./research,./course"
+
+# Every project at once. Without --output, each directory is named after its project.
+python claude_export_extractor.py export.zip --extract all
 ```
 
 ### Exact Conversation Matching (Recommended)
