@@ -144,8 +144,8 @@ Each extracted project creates this organized layout:
 │   └── Architecture review.md
 ├── files/                                 # documents Claude wrote during a conversation
 │   └── Building the API client/           #   one folder per conversation that produced any
-│       ├── api-client.py
-│       ├── RELEASE_NOTES.md
+│       ├── helper.py
+│       ├── summary.md
 │       └── _manifest.json                 #   where each came from, and whether it is complete
 └── thinking/                              # only with --thinking; same filenames as above
     └── Building the API client.md
@@ -387,8 +387,8 @@ conversation, named after the transcript:
 ├── conversations/   Building the API client.md
 └── files/
     └── Building the API client/
-        ├── api-client.py
-        ├── RELEASE_NOTES.md
+        ├── helper.py
+        ├── summary.md
         └── _manifest.json
 ```
 
@@ -402,10 +402,10 @@ separately any edits that named a file this conversation never shows being creat
 ```json
 {
   "files": [
-    {"file": "roadmap.md", "source": "/mnt/user-data/outputs/roadmap.md",
+    {"file": "plan.md", "source": "/mnt/user-data/outputs/plan.md",
      "edits_applied": 18, "edits_unmatched": 4, "complete": false}
   ],
-  "orphaned_edits": [{"path": "/home/claude/SPEC.md", "edits": 18}]
+  "orphaned_edits": [{"path": "/home/claude/design-notes.md", "edits": 18}]
 }
 ```
 
@@ -419,7 +419,7 @@ of the transcript.
 When an orphan does share its base name with a file that *was* written, that file says so:
 
 ```json
-{"file": "SPEC.md", "edits_applied": 34, "edits_unmatched": 1, "complete": false,
+{"file": "design-notes.md", "edits_applied": 34, "edits_unmatched": 1, "complete": false,
  "orphan_edits_may_target_this": 16}
 ```
 
@@ -436,7 +436,7 @@ a later edit no longer matches what the replay holds. That is counted, not guess
 manifest marks the file `"complete": false` and the transcript says so in plain words:
 
 ```
-> [File written: roadmap.md → files/Planning/roadmap.md]
+> [File written: plan.md → files/Weekly sync/plan.md]
 > [Reconstruction incomplete: 4 of 22 edits could not be applied — this file was also
 > changed outside the recorded tool calls, so what is written here is the last state the
 > transcript can account for.]
