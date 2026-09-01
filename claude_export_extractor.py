@@ -1330,6 +1330,11 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
         return False
 
     if choice.lower() == "all":
+        if not index:
+            # "all" is the one answer that can select nothing: every other path either
+            # names a number that must be in range, or fails to parse.
+            print("This export contains no projects to extract.")
+            return False
         selected = list(range(len(index)))
     else:
         try:
@@ -1378,7 +1383,9 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
             print(f"  {stats['files']} files Claude produced")
 
     # The first directory, so a caller wanting somewhere to put run-level files has one.
-    return extractions[0][1]
+    # Falsy when nothing was extracted, which is what the caller reads as "no output to
+    # put anything beside" — and keeps a future empty selection from indexing into [0].
+    return extractions[0][1] if extractions else False
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────

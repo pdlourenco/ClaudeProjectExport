@@ -288,6 +288,19 @@ def main():
               none_proc.stderr.startswith("ERROR: ") and "Traceback" not in none_proc.stderr,
               none_proc.stderr.strip().splitlines()[-1][:90])
 
+        # The interactive twin of the same edge. "all" is the one answer that can select
+        # nothing — every other path names a number that must be in range, or fails to
+        # parse — and selecting nothing used to index into an empty extraction list.
+        interactive_none = run(EXTRACTOR, empty_zip, stdin="all\nY\n")
+        check("interactive 'all' on an export with no projects says so instead of crashing",
+              "no projects to extract" in interactive_none.stdout
+              and "Traceback" not in interactive_none.stderr,
+              interactive_none.stderr.strip().splitlines()[-1][:70] if interactive_none.stderr.strip() else "clean")
+        faithful_none = run(EXTRACTOR, empty_zip, "--faithful", stdin="all\nY\n")
+        check("...and --faithful does not then try to place account files",
+              "Traceback" not in faithful_none.stderr
+              and "Account files" not in faithful_none.stdout)
+
         # ── Error handling ───────────────────────────────────────────────────
         print("\nError handling")
         bad = tmp / "bad"
