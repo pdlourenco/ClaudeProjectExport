@@ -13,6 +13,7 @@ archive happened to list first.
 Self-contained: no framework, no fixtures on disk, no dependencies.
 """
 
+import importlib.util
 import json
 import subprocess
 import sys
@@ -112,6 +113,47 @@ def write_split(path: Path):
     return path
 
 
+def write_nested(path: Path, prefix="conversations-with-claude/unprocessed/", reverse=False):
+    """The current layout nested under a folder whose own name contains "conversation".
+
+    Real exports now arrive this way, which defeats any classification that substring-matches
+    the whole path: every entry, project files included, then contains "conversation".
+    `reverse` writes the same bytes in the opposite archive order, which is equally legal and
+    used to decide which file was read as the conversation list.
+    """
+    entries = [("users.json", json.dumps([{"uuid": "u1"}])),
+               ("conversations.json", json.dumps(CONVERSATIONS, indent=2)),
+               ("login_history.json", json.dumps([])),
+               ("memories/acct-1.json", json.dumps([]))]
+    entries += [(f"projects/{proj['uuid']}.json", json.dumps(proj, indent=2))
+                for proj in PROJECTS]
+    if reverse:
+        entries.reverse()
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, body in entries:
+            zf.writestr(prefix + name, body)
+    return path
+
+
+def write_per_conversation(path: Path):
+    """A conversations/<uuid>.json layout, the shape projects already moved to."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("users.json", json.dumps([{"uuid": "u1"}]))
+        for proj in PROJECTS:
+            zf.writestr(f"projects/{proj['uuid']}.json", json.dumps(proj, indent=2))
+        for conv in CONVERSATIONS:
+            zf.writestr(f"conversations/{conv['uuid']}.json", json.dumps(conv, indent=2))
+    return path
+
+
+def account_files(zip_path):
+    """The account-level files the extractor would carry across with --faithful."""
+    spec = importlib.util.spec_from_file_location("cpe", EXTRACTOR)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return sorted(module.load_account_files(Path(zip_path)))
+
+
 def index(zip_path, script=EXTRACTOR):
     proc = subprocess.run([sys.executable, str(script), str(zip_path), "--json"],
                           capture_output=True, text=True)
@@ -135,6 +177,30 @@ def main():
     check("docs and prompts survive the per-project layout",
           [(p["doc_count"], p["has_prompt"]) for p in split] == [(1, False), (0, False), (0, True)],
           str([(p["doc_count"], p["has_prompt"]) for p in split]))
+
+    # ── The nested layout, and what its folder name broke ────────────────────
+    print("\nNested layout")
+    nested = index(write_nested(tmp / "nested.zip"))
+    reversed_ = index(write_nested(tmp / "nested_rev.zip", reverse=True))
+    check("projects load when everything is nested under a 'conversation...' folder",
+          len(nested) == len(PROJECTS), f"{len(nested)} of {len(PROJECTS)}")
+    check("conversations load there too",
+          sum(p["conv_count"] for p in nested) == sum(p["conv_count"] for p in split),
+          f"{sum(p['conv_count'] for p in nested)} conversations matched")
+    # The old classifier read whichever matching file the archive happened to list first,
+    # so the same export in a different order silently produced no conversations at all.
+    check("archive order does not decide what gets read", nested == reversed_,
+          "same bytes, entries written in the opposite order")
+    check("account files survive the nested layout",
+          account_files(tmp / "nested.zip") == ["acct-1.json", "login_history.json", "users.json"],
+          str(account_files(tmp / "nested.zip")))
+    check("a project file is never mistaken for the conversation list",
+          all(p["conv_count"] >= 0 for p in nested) and len(nested) == len(PROJECTS))
+
+    per_conv = index(write_per_conversation(tmp / "per_conv.zip"))
+    check("a conversations/<uuid>.json layout loads every conversation",
+          sum(p["conv_count"] for p in per_conv) == sum(p["conv_count"] for p in split),
+          f"{sum(p['conv_count'] for p in per_conv)} vs {sum(p['conv_count'] for p in split)}")
 
     # The fix must be a no-op on the layout that already worked.
     try:
