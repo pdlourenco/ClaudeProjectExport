@@ -134,6 +134,11 @@ Each extracted project creates this organized layout:
 │   ├── Building the API client.md         # Related conversations as readable markdown
 │   ├── Debugging auth flow.md             #   (matched by project name keywords)
 │   └── Architecture review.md
+├── files/                                 # documents Claude wrote during a conversation
+│   └── Building the API client/           #   one folder per conversation that produced any
+│       ├── api-client.py
+│       ├── RELEASE_NOTES.md
+│       └── _manifest.json                 #   where each came from, and whether it is complete
 └── thinking/                              # only with --thinking; same filenames as above
     └── Building the API client.md
 ```
@@ -357,6 +362,51 @@ Conversations that carry no reasoning simply have no file — on that same expor
 unfiled conversations had any. Blocks that are empty, or whose text the export withheld, are
 skipped rather than written as empty sections.
 
+### What about documents Claude wrote for me?
+
+They're extracted by default, into `files/`.
+
+The export records a written document as a tool call, not as a file, and there are two kinds.
+An artifact — the side-panel document — carries its whole body every time it's revised. A file
+written to `/mnt/user-data/outputs/` is created once by `create_file` and then edited by
+`str_replace`, so the export holds a first draft and a list of changes rather than the result.
+
+This tool replays those calls in order and writes what the file finally said, one folder per
+conversation, named after the transcript:
+
+```
+<output_dir>/
+├── conversations/   Building the API client.md
+└── files/
+    └── Building the API client/
+        ├── api-client.py
+        ├── RELEASE_NOTES.md
+        └── _manifest.json
+```
+
+Each file also gets a marker in the transcript at the point it was written, so reading the
+conversation tells you a document exists and where it went.
+
+`_manifest.json` records where each file came from — files are written under their base name,
+so the full source path would otherwise be lost — along with how many edits were replayed.
+
+**Replay is only ever as complete as the record.** A file the conversation also changed through
+the shell — a heredoc, `sed`, a script it ran — moves without leaving a tool call to replay, so
+a later edit no longer matches what the replay holds. That is counted, not guessed at: the
+manifest marks the file `"complete": false` and the transcript says so in plain words:
+
+```
+> [File written: roadmap.md → files/Planning/roadmap.md]
+> [Reconstruction incomplete: 4 of 22 edits could not be applied — this file was also
+> changed outside the recorded tool calls, so what is written here is the last state the
+> transcript can account for.]
+```
+
+On the export this was built against, 107 files were recovered across 33 conversations —
+1.3 million characters — and 7 were flagged incomplete. All of it was previously dropped:
+before this, only artifacts reached the output, inlined into the transcript, while every file
+written by `create_file` was silently discarded.
+
 ### Can I extract everything, losing nothing?
 
 `--faithful`:
@@ -382,6 +432,7 @@ own summary, and the reply-threading ids.
 ```
 <output_dir>/
 ├── conversations/   Weekly sync.md
+├── files/           Weekly sync/…        # written by default, not only with --faithful
 ├── thinking/        Weekly sync.md
 └── raw/
     ├── project.json

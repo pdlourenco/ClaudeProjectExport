@@ -92,6 +92,20 @@ def detect_extension(content: str, filename: str = "") -> str:
     return ".txt"
 
 
+def safe_filename(name: str, max_len: int = 80) -> str:
+    """Sanitize a filename, truncating the stem so the extension survives.
+
+    safe_name truncates blind, which for a long name cuts the extension off the end and
+    leaves a file nothing will open — the same failure that used to lose knowledge docs.
+    A file Claude wrote is named by its own extension, so that has to be kept.
+    """
+    stem, dot, ext = name.rpartition(".")
+    if not dot or len(ext) > 10 or not stem:
+        return safe_name(name, max_len)
+    ext = "." + re.sub(r'[^A-Za-z0-9]', "", ext)
+    return (safe_name(stem, max(1, max_len - len(ext))) + ext) if len(ext) > 1 else safe_name(name, max_len)
+
+
 class NameAllocator:
     """Hands out write paths within one directory, disambiguating collisions as name_1.ext.
 
@@ -452,7 +466,7 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False,
     conv_dir = output_dir / "conversations"
     docs_dir.mkdir(exist_ok=True)
 
-    stats = {"docs": 0, "conversations": 0, "docs_kb": 0, "convs_msgs": 0}
+    stats = {"docs": 0, "conversations": 0, "docs_kb": 0, "convs_msgs": 0, "files": 0}
 
     # ── Save project metadata ────────────────────────────────────────────
     meta = {
@@ -505,7 +519,7 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False,
                 conv, conv_names, docs_dir,
                 thinking_dir=(output_dir / "thinking") if include_thinking else None,
                 raw_dir=(output_dir / "raw" / "conversations") if faithful else None,
-                faithful=faithful)
+                faithful=faithful, files_root=output_dir / "files", counters=stats)
             stats["conversations"] += 1
 
     if faithful and entry.get("source") is not None:
@@ -520,7 +534,8 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False,
 
 
 def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_dir=None,
-                       raw_dir=None, faithful: bool = False) -> int:
+                       raw_dir=None, faithful: bool = False, files_root=None,
+                       counters=None) -> int:
     """Write one conversation as markdown, via `names`; return its message count.
 
     Text content from attachments is written alongside, into attach_dir. The allocator is
@@ -536,6 +551,9 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
 
     `faithful` adds the parts of a message the transcript drops — which tool ran, what came
     back, the sources cited — rather than only the prose.
+
+    files_root receives the documents the conversation produced, in a folder named for the
+    transcript. They are part of what was said, not an extra, so this is not behind a flag.
     """
     title = conv.get("name") or "Untitled"
     conv_id = conv.get("uuid", "unknown")
@@ -554,6 +572,26 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
     if summary:
         lines.append(f"> {summary}\n")
     lines.append("---\n")
+
+    # The transcript's name is claimed before its body is built, because the files this
+    # conversation produced are filed under that name and the markers pointing at them are
+    # written inline. Allocation order across conversations is unchanged — still one claim
+    # per conversation, in the same sequence.
+    out_path = names.allocate(safe_name(title) + ".md")
+
+    # Replayed up front: a marker sits at the message that wrote the file, but what it
+    # has to say — whether the replay stayed consistent to the end — is only known once
+    # every later edit has been applied.
+    produced = collect_files(conv) if files_root is not None else {}
+    files_folder = out_path.stem
+    if produced:
+        written = write_conversation_files(produced, Path(files_root) / files_folder)
+        if counters is not None:
+            counters["files"] = counters.get("files", 0) + written
+    by_message = {}
+    for record in produced.values():
+        if record.get("message") is not None:
+            by_message.setdefault(id(record["message"]), []).append(record)
 
     thinking_lines = []
     for msg in messages:
@@ -606,6 +644,12 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
         if attach_notes:
             lines.append("")
 
+        written_here = by_message.get(id(msg), [])
+        if written_here:
+            for record in written_here:
+                lines.append(_file_marker(record, f"files/{files_folder}"))
+            lines.append("")
+
         if faithful:
             extra = _render_tool_calls(msg) + _render_citations(msg)
             for f in (msg.get("files") or []):
@@ -616,7 +660,6 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
 
         lines.append("---\n")
 
-    out_path = names.allocate(safe_name(title) + ".md")
     out_path.write_text("\n".join(lines), encoding="utf-8", errors="backslashreplace")
 
     if raw_dir is not None:
@@ -642,6 +685,189 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
             "\n".join(header + thinking_lines), encoding="utf-8", errors="backslashreplace")
 
     return len(messages)
+
+
+# ── Files Claude produced ─────────────────────────────────────────────────────
+
+# An artifact's media type names the file it stands for. `language` refines the code
+# case, which is one media type covering every language.
+ARTIFACT_TYPES = {
+    "text/markdown": ".md",
+    "text/html": ".html",
+    "text/plain": ".txt",
+    "text/csv": ".csv",
+    "image/svg+xml": ".svg",
+    "application/vnd.ant.mermaid": ".mmd",
+    "application/vnd.ant.react": ".jsx",
+}
+
+LANGUAGE_EXTENSIONS = {
+    "python": ".py", "javascript": ".js", "typescript": ".ts", "bash": ".sh",
+    "sh": ".sh", "json": ".json", "yaml": ".yaml", "html": ".html", "css": ".css",
+    "sql": ".sql", "matlab": ".m", "r": ".R", "java": ".java", "c": ".c",
+    "cpp": ".cpp", "go": ".go", "rust": ".rs", "ruby": ".rb", "php": ".php",
+}
+
+
+def _artifact_filename(inp: dict, content: str) -> str:
+    """Name an artifact, which has a title and a media type but no path of its own."""
+    title = str(inp.get("title") or "artifact")
+    if inp.get("type") == "application/vnd.ant.code":
+        ext = LANGUAGE_EXTENSIONS.get(str(inp.get("language") or "").lower(), ".txt")
+    else:
+        ext = ARTIFACT_TYPES.get(inp.get("type"), "")
+    if not ext:
+        ext = detect_extension(content, title)
+    base = safe_name(title, max(1, 80 - len(ext)))
+    return base + ("" if base.lower().endswith(ext.lower()) else ext)
+
+
+def collect_files(conv) -> dict:
+    """Rebuild the files a conversation produced, by replaying the tool calls that wrote them.
+
+    Claude writes a document one of two ways, and the export records both but neither as a
+    file: an artifact carries its whole body on every revision, while `create_file` writes
+    a body once and `str_replace` edits it afterwards. Replaying those in order recovers
+    what the file finally said.
+
+    Replay is only ever as complete as the record. A file the conversation also changed
+    through the shell — a heredoc, sed, a script it ran — moves without leaving a tool
+    call to replay, so a later edit no longer matches what we hold. That is counted rather
+    than guessed at: `complete` is False for such a file and the caller says so, because a
+    file that silently claims to be final is worse than one that admits it isn't.
+
+    Returns {key: record}, in the order the files were first written.
+    """
+    files = {}
+    last_path = None
+
+    for msg in conv.get("chat_messages") or conv.get("messages") or []:
+        blocks = msg.get("content")
+        if isinstance(blocks, dict):
+            blocks = [blocks]
+        if not isinstance(blocks, list):
+            continue
+
+        for block in blocks:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name") or ""
+            inp = block.get("input")
+            if not isinstance(inp, dict):
+                continue
+
+            if name == "artifacts":
+                _replay_artifact(files, inp, msg)
+                continue
+
+            path = inp.get("path")
+            text = inp.get("file_text")
+
+            # Keyed on the shape rather than the tool name: a differently-named tool
+            # writing a path and a body is the same event, and the export has renamed
+            # its tools before.
+            if isinstance(path, str) and isinstance(text, str):
+                record = files.get(path)
+                if record is None:
+                    files[path] = {
+                        "name": Path(path).name or safe_name(path),
+                        "source": path, "origin": "create_file", "content": text,
+                        "applied": 0, "unmatched": 0, "message": msg,
+                    }
+                else:
+                    # A second write to the same path replaces it, as the tool would.
+                    record["content"] = text
+                last_path = path
+                continue
+
+            if isinstance(inp.get("old_str"), str) and isinstance(inp.get("new_str"), str):
+                # str_replace usually names its path; a handful of calls in real exports
+                # omit it, meaning the file the conversation was last working on.
+                target = path if isinstance(path, str) else last_path
+                record = files.get(target)
+                if record is None:
+                    continue
+                _apply_edit(record, inp["old_str"], inp["new_str"])
+                last_path = target
+
+    for record in files.values():
+        record["complete"] = record["unmatched"] == 0
+    return files
+
+
+def _replay_artifact(files, inp: dict, msg=None):
+    """Apply one artifacts call. Every revision carries the whole body, bar `update`."""
+    command = inp.get("command")
+    key = inp.get("id") or inp.get("title") or "artifact"
+    key = f"artifact:{key}"
+    content = inp.get("content")
+    record = files.get(key)
+
+    if isinstance(content, str) and command in (None, "create", "rewrite", "update"):
+        if record is None:
+            files[key] = {
+                "name": _artifact_filename(inp, content), "source": inp.get("title") or key,
+                "origin": "artifact", "content": content,
+                "applied": 0, "unmatched": 0, "message": msg,
+            }
+        else:
+            record["content"] = content
+        return
+
+    if record is not None and command == "update":
+        old, new = inp.get("old_str"), inp.get("new_str")
+        if isinstance(old, str) and isinstance(new, str):
+            _apply_edit(record, old, new)
+
+
+def _apply_edit(record, old: str, new: str):
+    """Replace one occurrence, or record that the file had moved out from under the edit."""
+    if old and record["content"].count(old) == 1:
+        record["content"] = record["content"].replace(old, new, 1)
+        record["applied"] += 1
+    else:
+        record["unmatched"] += 1
+
+
+def write_conversation_files(records, directory: Path) -> int:
+    """Write the reconstructed files, plus a manifest naming where each came from.
+
+    Files are written under their base name, so the manifest carries the full source path
+    — two directories in one conversation can hold the same base name, and the allocator
+    disambiguates that on disk without recording which was which.
+    """
+    if not records:
+        return 0
+    directory.mkdir(parents=True, exist_ok=True)
+    allocator = NameAllocator(directory, reserved=("_manifest.json",))
+    manifest = []
+    for record in records.values():
+        out_path = allocator.allocate(safe_filename(record["name"]) or "file")
+        out_path.write_text(record["content"], encoding="utf-8", errors="backslashreplace")
+        record["written"] = out_path.name
+        manifest.append({
+            "file": out_path.name,
+            "source": record["source"],
+            "origin": record["origin"],
+            "characters": len(record["content"]),
+            "edits_applied": record["applied"],
+            "edits_unmatched": record["unmatched"],
+            "complete": record["complete"],
+        })
+    (directory / "_manifest.json").write_text(
+        json.dumps(manifest, indent=2), encoding="utf-8")
+    return len(manifest)
+
+
+def _file_marker(record, folder: str) -> str:
+    """One line in the transcript pointing at the file this message produced."""
+    marker = f"> [File written: {record['written']} → {folder}/{record['written']}]"
+    if record["complete"]:
+        return marker
+    return (marker + f"\n> [Reconstruction incomplete: {record['unmatched']} of "
+            f"{record['applied'] + record['unmatched']} edits could not be applied — this "
+            f"file was also changed outside the recorded tool calls, so what is written "
+            f"here is the last state the transcript can account for.]")
 
 
 def _conv_key(conv):
@@ -690,14 +916,14 @@ def extract_unfiled(conversations, output_dir: Path, include_thinking: bool = Fa
     """Write every unfiled conversation into a single bucket directory."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    stats = {"conversations": 0, "convs_msgs": 0}
+    stats = {"conversations": 0, "convs_msgs": 0, "files": 0}
     names = NameAllocator(output_dir)
     for conv in conversations:
         stats["convs_msgs"] += write_conversation(
             conv, names, output_dir / "attachments",
             thinking_dir=(output_dir / "thinking") if include_thinking else None,
             raw_dir=(output_dir / "raw" / "conversations") if faithful else None,
-            faithful=faithful)
+            faithful=faithful, files_root=output_dir / "files", counters=stats)
         stats["conversations"] += 1
 
     return stats
@@ -731,12 +957,24 @@ def _render_tool_calls(msg) -> list:
                 lines.append(f"> {note}")
             inp = block.get("input")
             if isinstance(inp, dict):
-                # The artifact body is already in the transcript; don't repeat it here.
-                shown = {k: v for k, v in inp.items() if k != "content"}
+                # Bodies are omitted rather than repeated: the artifact body is already in
+                # the transcript, and a written file's body is in files/ under its own
+                # name. Rendering file_text here would inline a whole document as escaped
+                # JSON and then cut it at the limit below — which is how 1.3M characters
+                # of written files used to read as a truncated blob.
+                shown = {k: v for k, v in inp.items()
+                         if k not in ("content", "file_text")}
+                if "file_text" in inp:
+                    # Plain ASCII on purpose: this value goes through json.dumps, which
+                    # escapes anything else to \uXXXX and would render as line noise.
+                    shown["file_text"] = f"<{len(str(inp['file_text']))} characters, written to files/>"
                 if shown:
                     lines.append("> ```json")
-                    for row in json.dumps(shown, indent=2)[:2000].splitlines():
+                    dumped = json.dumps(shown, indent=2)
+                    for row in dumped[:2000].splitlines():
                         lines.append(f"> {row}")
+                    if len(dumped) > 2000:
+                        lines.append(f"> … truncated, {len(dumped) - 2000} more characters")
                     lines.append("> ```")
             lines.append("")
         elif btype == "tool_result":
@@ -746,7 +984,10 @@ def _render_tool_calls(msg) -> list:
             for key in ("message", "display_content"):
                 value = block.get(key)
                 if isinstance(value, str) and value.strip():
-                    lines.append(f"> {value.strip()[:2000]}")
+                    text = value.strip()
+                    lines.append(f"> {text[:2000]}")
+                    if len(text) > 2000:
+                        lines.append(f"> … truncated, {len(text) - 2000} more characters")
             lines.append("")
     return lines
 
@@ -1008,6 +1249,8 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
         stats = extract_or_exit(entry, out_dir, show_strategy, include_thinking, faithful)
         print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
         print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
+        if stats.get("files"):
+            print(f"  {stats['files']} files Claude produced")
 
     # The first directory, so a caller wanting somewhere to put run-level files has one.
     return extractions[0][1]
@@ -1165,6 +1408,8 @@ def main():
                                     args.thinking or args.faithful, args.faithful)
             print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
             print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
+            if stats.get("files"):
+                print(f"  {stats['files']} files Claude produced")
 
         _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
@@ -1209,6 +1454,8 @@ def _extract_unfiled(unfiled_dir, unfiled, include_thinking: bool = False,
     print(f"\nExtracting unfiled conversations -> {out_dir}")
     stats = extract_unfiled(unfiled, out_dir, include_thinking, faithful)
     print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
+    if stats.get("files"):
+        print(f"  {stats['files']} files Claude produced")
 
 
 if __name__ == "__main__":
