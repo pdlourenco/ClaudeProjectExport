@@ -499,6 +499,50 @@ def main():
         check("a conversation with no file activity gets no files folder",
               not (quiet / "files").exists())
 
+        # An orphan sharing a base name with a file we did write is probably an edit to that
+        # file under another path. Still not applied — but the file says so, rather than
+        # leaving a reader to match names across two lists.
+        suspect = tmp / "suspect_orphans.zip"
+        with zipfile.ZipFile(suspect, "w") as zf:
+            zf.writestr("projects.json", json.dumps([{
+                "uuid": "p-1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "description": "", "prompt_template": "", "docs": []}]))
+            zf.writestr("conversations.json", json.dumps([{
+                "uuid": "c1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "chat_messages": [
+                    assistant(1, [tool("create_file", {"path": "/repo/a.md",
+                                                       "file_text": "hello\n"}, 1),
+                                  tool("str_replace", {"path": "a.md", "old_str": "hello",
+                                                       "new_str": "HELLO"}, 2),
+                                  tool("str_replace", {"path": "/other/a.md", "old_str": "x",
+                                                       "new_str": "y"}, 3)]),
+                    assistant(2, [tool("create_file", {"path": "/repo/clean.md",
+                                                       "file_text": "untouched\n"}, 4)]),
+                    assistant(3, [tool("str_replace", {"path": "/never/seen.md",
+                                                       "old_str": "p", "new_str": "q"}, 5)]),
+                ]}]))
+        sout = tmp / "suspect_out"
+        run(EXTRACTOR, suspect, "--extract", "1", "--output", sout)
+        sdoc = json.loads((sout / "files" / "Alpha" / "_manifest.json").read_text(encoding="utf-8"))
+        entries = {e["file"]: e for e in sdoc["files"]}
+        check("a file is told when orphan edits name it at another path",
+              entries["a.md"].get("orphan_edits_may_target_this") == 2,
+              "both a.md and /other/a.md share its base name")
+        check("a file no orphan resembles is left alone",
+              "orphan_edits_may_target_this" not in entries["clean.md"])
+        check("the suspicion does not change what was applied, or the complete flag",
+              (sout / "files" / "Alpha" / "a.md").read_text(encoding="utf-8") == "hello\n"
+              and entries["a.md"]["complete"] is True
+              and entries["a.md"]["edits_applied"] == 0,
+              "narrow by design: complete means every edit keyed to this path applied")
+        check("an orphan resembling nothing written is attributed to no file",
+              all("orphan_edits_may_target_this" not in e for e in sdoc["files"]
+                  if e["file"] == "clean.md")
+              and any(o["path"] == "/never/seen.md" for o in sdoc["orphaned_edits"]))
+        strans = (sout / "conversations" / "Alpha.md").read_text(encoding="utf-8")
+        check("the transcript says it where the file is written, not only in the manifest",
+              "2 further edits in this conversation name a file called a.md" in strans)
+
         # Hostile shapes, each of which reached the disk in an earlier draft of this work.
         hostile = tmp / "hostile_files.zip"
         long_name = "L" * 300

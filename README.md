@@ -408,6 +408,20 @@ would be a guess: on the measured export that guess would have applied **12 of 2
 to the wrong file. So they are counted and named instead, in the manifest and once at the top
 of the transcript.
 
+When an orphan does share its base name with a file that *was* written, that file says so:
+
+```json
+{"file": "SPEC.md", "edits_applied": 34, "edits_unmatched": 1, "complete": false,
+ "orphan_edits_may_target_this": 16}
+```
+
+The edits are still not applied, and `complete` is untouched — it means precisely "every edit
+keyed to this file's own path applied", and nothing wider. Widening it would mark every
+document in a conversation suspect because one file was edited through the shell. The extra
+count is the narrow version: this file, these edits, may belong together. It appears only when
+there is something to report, in the manifest and beside the file's marker in the transcript,
+so noticing it never depends on matching a name across two lists.
+
 **Replay is only ever as complete as the record.** A file the conversation also changed through
 the shell — a heredoc, `sed`, a script it ran — moves without leaving a tool call to replay, so
 a later edit no longer matches what the replay holds. That is counted, not guessed at: the

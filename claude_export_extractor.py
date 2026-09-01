@@ -734,6 +734,15 @@ def _artifact_filename(inp: dict, content: str) -> str:
     return base + ("" if base.lower().endswith(ext.lower()) else ext)
 
 
+def base_name(path: str) -> str:
+    """Last segment of a path, whichever separator the tool that wrote it used.
+
+    Not Path(...).name: the tool that recorded the path may have been running under a
+    different OS than the one extracting, and a POSIX Path never splits a backslash.
+    """
+    return str(path).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+
+
 def collect_files(conv) -> dict:
     """Rebuild the files a conversation produced, by replaying the tool calls that wrote them.
 
@@ -790,7 +799,7 @@ def collect_files(conv) -> dict:
                 record = files.get(path)
                 if record is None:
                     files[path] = {
-                        "name": Path(path).name or safe_name(path),
+                        "name": base_name(path) or safe_name(path),
                         "source": path, "origin": "create_file", "content": text,
                         "applied": 0, "unmatched": 0, "message": msg,
                     }
@@ -813,9 +822,24 @@ def collect_files(conv) -> dict:
                 _apply_edit(record, inp["old_str"], inp["new_str"])
                 last_path = target
 
+    # An orphan naming the same base name as a file we did write is very likely an edit to
+    # that file under another path — a working copy at /home/claude/x.md against a published
+    # /mnt/user-data/outputs/x.md. It is still not applied: on the measured export that guess
+    # would be wrong about half the time. But the file it probably belongs to should say so,
+    # rather than leaving a reader to spot the resemblance across two lists.
+    by_base = {}
     for record in files.values():
-        # Per recorded path: every edit keyed to this file's own path applied. An edit that
-        # named the file differently is an orphan, and shows up in that list instead.
+        by_base.setdefault(base_name(record["source"]), []).append(record)
+    for record in files.values():
+        record["suspect_orphans"] = 0
+    for path, count in orphans.items():
+        for record in by_base.get(base_name(path), ()):
+            record["suspect_orphans"] += count
+
+    for record in files.values():
+        # Deliberately narrow: every edit keyed to this file's own path applied. Widening it
+        # to "and no orphans anywhere in the conversation" would mark every document in a
+        # conversation suspect because one file was edited through the shell.
         record["complete"] = record["unmatched"] == 0
     return files, orphans
 
@@ -870,7 +894,7 @@ def write_conversation_files(records, orphans, directory: Path) -> int:
         out_path = allocator.allocate(safe_filename(record["name"]) or "file")
         out_path.write_text(record["content"], encoding="utf-8", errors="backslashreplace")
         record["written"] = out_path.name
-        manifest.append({
+        entry = {
             "file": out_path.name,
             "source": record["source"],
             "origin": record["origin"],
@@ -878,7 +902,12 @@ def write_conversation_files(records, orphans, directory: Path) -> int:
             "edits_applied": record["applied"],
             "edits_unmatched": record["unmatched"],
             "complete": record["complete"],
-        })
+        }
+        if record.get("suspect_orphans"):
+            # Absent means none. Present means this many edits named this file's base name
+            # under a path it was never created at, so they may belong here — unapplied.
+            entry["orphan_edits_may_target_this"] = record["suspect_orphans"]
+        manifest.append(entry)
     (directory / "_manifest.json").write_text(
         json.dumps({
             "files": manifest,
@@ -889,14 +918,23 @@ def write_conversation_files(records, orphans, directory: Path) -> int:
 
 
 def _file_marker(record, folder: str) -> str:
-    """One line in the transcript pointing at the file this message produced."""
-    marker = f"> [File written: {record['written']} → {folder}/{record['written']}]"
-    if record["complete"]:
-        return marker
-    return (marker + f"\n> [Reconstruction incomplete: {record['unmatched']} of "
+    """The transcript's line for a file this message produced, and what it can't vouch for."""
+    lines = [f"> [File written: {record['written']} → {folder}/{record['written']}]"]
+    if not record["complete"]:
+        lines.append(
+            f"> [Reconstruction incomplete: {record['unmatched']} of "
             f"{record['applied'] + record['unmatched']} edits could not be applied — this "
             f"file was also changed outside the recorded tool calls, so what is written "
             f"here is the last state the transcript can account for.]")
+    if record.get("suspect_orphans"):
+        # Said here as well as in the manifest: noticing it should not depend on a reader
+        # matching a name across two lists.
+        lines.append(
+            f"> [{record['suspect_orphans']} further edit"
+            f"{'s' if record['suspect_orphans'] != 1 else ''} in this conversation name a "
+            f"file called {record['name']} at a path it was never created at. They may "
+            f"belong to this file; they were not applied.]")
+    return "\n".join(lines)
 
 
 def _conv_key(conv):
