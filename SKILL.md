@@ -29,6 +29,8 @@ used as context for Claude Code work.
     <knowledge files>...      # All uploaded docs
   conversations/              # Related conversation history as markdown
     <conversation>.md ...     # One file per conversation
+  files/                      # Documents Claude wrote, one folder per conversation
+    <conversation>/           #   _manifest.json says where each came from
   thinking/                   # Only with --thinking or --faithful; same filenames as above
   raw/                        # Only with --faithful; the source records, verbatim
 ```
@@ -134,6 +136,13 @@ Two more flags worth offering rather than assuming:
 Confirm what was saved: doc count, conversation count, output paths, and — when a mapping was
 used — how many conversations were filed exactly versus left unfiled.
 
+If the run reported files, mention `files/`: those are the documents Claude wrote during the
+conversations, rebuilt from the tool calls that produced them. Check each `_manifest.json` for
+any entry with `"complete": false` and say so — that file was also changed outside the recorded
+tool calls, so it is the last state the transcript can account for rather than the final one.
+`orphaned_edits` in the same file lists edits to documents that were never created on record at
+all; those are not reconstructed, and saying which paths they name is more useful than silence.
+
 ## Notes
 
 - Re-running an extraction into the same directory is safe: it refreshes files in place rather
@@ -144,6 +153,10 @@ used — how many conversations were filed exactly versus left unfiled.
   both kept, disambiguated as `notes.txt` and `notes_1.txt`. Nothing is silently overwritten
 - Without `--thinking` or `--faithful`, Claude's reasoning is not extracted — about 44% of the
   message text on a measured export. Set that expectation if the user goes looking for it
+- Documents Claude wrote are extracted by default into `files/`, with a marker in the transcript
+  pointing at each. They are rebuilt by replaying the tool calls that wrote them, so a file the
+  conversation also edited through the shell is marked incomplete rather than passed off as
+  final — relay that distinction rather than smoothing it over
 - Errors are one-line messages on stderr with exit status 1. Relay them verbatim; they name the
   problem
 - `PYTHONIOENCODING=utf-8` is required on Windows to avoid emoji encoding errors

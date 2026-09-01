@@ -315,6 +315,283 @@ def main():
         check("colliding titles: reasoning filenames track the disambiguated transcripts",
               ct == cr and len(ct) == 3, f"{ct} vs {cr}")
 
+        # ── Files Claude produced ────────────────────────────────────────────
+        print("\nFiles Claude produced")
+
+        # Its own export rather than the shared fixture, deliberately. The shared fixture
+        # stays free of file-producing tools so the byte-compat guarantee above keeps a
+        # sharp meaning: a conversation that produces no files still extracts identically
+        # to the baseline. This one exercises every shape that writes a file.
+        def tool(name, inp, i):
+            return {"type": "tool_use", "name": name, "id": f"t{i}", "input": inp}
+
+        def assistant(i, blocks):
+            return {"uuid": f"m{i}", "sender": "assistant",
+                    "created_at": "2026-01-01T00:00:00Z", "content": blocks}
+
+        files_zip = tmp / "files.zip"
+        with zipfile.ZipFile(files_zip, "w") as zf:
+            zf.writestr("projects.json", json.dumps([{
+                "uuid": "p-1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "description": "", "prompt_template": "", "docs": []}]))
+            zf.writestr("conversations.json", json.dumps([{
+                "uuid": "c1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "chat_messages": [
+                    assistant(1, [
+                        {"type": "text", "text": "Writing it."},
+                        tool("create_file", {"path": "/mnt/user-data/outputs/notes.md",
+                                             "file_text": "# Notes\nalpha\nbravo\n"}, 1)]),
+                    # A normal edit, then one that omits its path (real exports contain
+                    # both), then one whose old_str is nowhere to be found.
+                    assistant(2, [tool("str_replace", {"path": "/mnt/user-data/outputs/notes.md",
+                                                       "old_str": "bravo",
+                                                       "new_str": "BRAVO"}, 2)]),
+                    assistant(3, [tool("str_replace", {"old_str": "alpha",
+                                                       "new_str": "ALPHA"}, 3)]),
+                    assistant(4, [tool("create_file", {"path": "/tmp/report.md",
+                                                       "file_text": "R1\n"}, 4)]),
+                    assistant(5, [tool("str_replace", {"path": "/tmp/report.md",
+                                                       "old_str": "GONE",
+                                                       "new_str": "x"}, 5)]),
+                    # An artifact carries its whole body on every revision, so the last
+                    # one wins outright rather than being replayed.
+                    assistant(6, [tool("artifacts", {"command": "create", "id": "a1",
+                                                     "type": "text/markdown",
+                                                     "title": "Research Report",
+                                                     "content": "v1\n"}, 6)]),
+                    assistant(7, [tool("artifacts", {"command": "rewrite", "id": "a1",
+                                                     "type": "text/markdown",
+                                                     "title": "Research Report",
+                                                     "content": "FINAL\n"}, 7)]),
+                    assistant(8, [tool("artifacts", {"command": "create", "id": "a2",
+                                                     "type": "application/vnd.ant.code",
+                                                     "language": "python",
+                                                     "title": "helper",
+                                                     "content": "print(1)\n"}, 8)]),
+                ]}]))
+
+        fout = tmp / "files_out"
+        proc = run(EXTRACTOR, files_zip, "--extract", "1", "--output", fout)
+        fdir = fout / "files" / "Alpha"
+        produced = sorted(f.name for f in fdir.glob("*")) if fdir.exists() else []
+        check("files are written without any flag",
+              produced == ["Research Report.md", "_manifest.json", "helper.py",
+                           "notes.md", "report.md"], f"{produced}")
+        check("the extraction says how many files it found",
+              "4 files Claude produced" in proc.stdout,
+              "4 documents plus the manifest")
+
+        notes = (fdir / "notes.md").read_text(encoding="utf-8")
+        check("edits are replayed onto the file they name",
+              "BRAVO" in notes and "bravo" not in notes)
+        check("an edit that omits its path applies to the file last written",
+              "ALPHA" in notes and "alpha" not in notes, notes.replace("\n", " "))
+        check("an artifact's last revision wins",
+              (fdir / "Research Report.md").read_text(encoding="utf-8").strip() == "FINAL")
+        check("a code artifact is named from its language",
+              (fdir / "helper.py").read_text(encoding="utf-8").strip() == "print(1)")
+
+        manifest_doc = json.loads((fdir / "_manifest.json").read_text(encoding="utf-8"))
+        manifest = {m["file"]: m for m in manifest_doc["files"]}
+        check("the manifest keeps the source path the base name loses",
+              manifest["notes.md"]["source"] == "/mnt/user-data/outputs/notes.md")
+        check("a file whose edits all applied is marked complete",
+              manifest["notes.md"]["complete"] and manifest["notes.md"]["edits_applied"] == 2)
+        check("an edit that could not be applied marks the file incomplete",
+              manifest["report.md"]["complete"] is False
+              and manifest["report.md"]["edits_unmatched"] == 1)
+
+        transcript = (fout / "conversations" / "Alpha.md").read_text(encoding="utf-8")
+        check("the transcript points at each file it produced",
+              transcript.count("[File written:") == 4,
+              f"{transcript.count('[File written:')} markers")
+        check("the marker gives a path that resolves from the output root",
+              (fout / "files" / "Alpha" / "notes.md").exists()
+              and "files/Alpha/notes.md" in transcript)
+        check("an incomplete reconstruction says so in the transcript",
+              "Reconstruction incomplete" in transcript
+              and transcript.count("Reconstruction incomplete") == 1)
+
+        # The whole point of the change: the baseline wrote none of this.
+        if baseline:
+            base_fout = tmp / "files_base"
+            run(baseline, files_zip, "--extract", "1", "--output", base_fout)
+            base_trans = (base_fout / "conversations" / "Alpha.md").read_text(encoding="utf-8")
+            # The artifact body did reach the baseline transcript; a written file's never
+            # did. That asymmetry — same document, two tools — is the whole bug.
+            check("the baseline wrote no files at all",
+                  not (base_fout / "files").exists())
+            check("the baseline dropped every written file, while keeping artifacts",
+                  "# Notes" not in base_trans and "FINAL" in base_trans)
+
+        # A written body is a document, not tool noise: --faithful must point at it rather
+        # than inline a whole file as escaped JSON and cut it off mid-way.
+        ffaith = tmp / "files_faithful"
+        run(EXTRACTOR, files_zip, "--faithful", "--extract", "1", "--output", ffaith)
+        ftrans = (ffaith / "conversations" / "Alpha.md").read_text(encoding="utf-8")
+        check("--faithful points at the written file instead of inlining its body",
+              "characters, written to files/>" in ftrans
+              and "# Notes\\nalpha" not in ftrans,
+              "the body is named and located, not pasted in as escaped JSON")
+        check("--faithful still writes the files and the raw records",
+              (ffaith / "files" / "Alpha" / "notes.md").exists()
+              and (ffaith / "raw" / "conversations" / "Alpha.json").exists())
+
+        # An edit naming a file the conversation never shows being created — the shell
+        # wrote it, or it is the same document under a second path. Nothing can be
+        # reconstructed, and resolving by base name would be a guess that is wrong about
+        # half the time on real data, so it is counted instead of dropped.
+        orphan = tmp / "orphan_edits.zip"
+        with zipfile.ZipFile(orphan, "w") as zf:
+            zf.writestr("projects.json", json.dumps([{
+                "uuid": "p-1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "description": "", "prompt_template": "", "docs": []}]))
+            zf.writestr("conversations.json", json.dumps([{
+                "uuid": "c1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "chat_messages": [
+                    assistant(1, [tool("str_replace", {"path": "/made/by/bash.md",
+                                                       "old_str": "a", "new_str": "b"}, 1),
+                                  tool("str_replace", {"path": "/made/by/bash.md",
+                                                       "old_str": "c", "new_str": "d"}, 2)]),
+                    # Same document, second path form: created as /repo/a.md, edited as a.md.
+                    assistant(2, [tool("create_file", {"path": "/repo/a.md",
+                                                       "file_text": "hello\n"}, 3),
+                                  tool("str_replace", {"path": "a.md", "old_str": "hello",
+                                                       "new_str": "HELLO"}, 4)]),
+                ]}]))
+        oout = tmp / "orphan_out"
+        run(EXTRACTOR, orphan, "--extract", "1", "--output", oout)
+        odoc = json.loads((oout / "files" / "Alpha" / "_manifest.json").read_text(encoding="utf-8"))
+        counts = {e["path"]: e["edits"] for e in odoc["orphaned_edits"]}
+        check("an edit to a file never created here is counted, not dropped",
+              counts.get("/made/by/bash.md") == 2, f"{counts}")
+        check("the same document under a second path is counted too",
+              counts.get("a.md") == 1, f"{counts}")
+        otrans = (oout / "conversations" / "Alpha.md").read_text(encoding="utf-8")
+        check("the transcript says so, since an orphan edit has no file to mark",
+              "3 edits in this conversation change 2 files it never shows being created" in otrans)
+        check("orphan edits are never applied by guessing at a matching base name",
+              (oout / "files" / "Alpha" / "a.md").read_text(encoding="utf-8") == "hello\n",
+              "resolving by base name would be wrong 12 times in 25 on real data")
+
+        # A conversation with only orphan edits still has to say so somewhere.
+        only = tmp / "only_orphans.zip"
+        with zipfile.ZipFile(only, "w") as zf:
+            zf.writestr("projects.json", json.dumps([{
+                "uuid": "p-1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "description": "", "prompt_template": "", "docs": []}]))
+            zf.writestr("conversations.json", json.dumps([{
+                "uuid": "c1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "chat_messages": [
+                    assistant(1, [tool("str_replace", {"path": "/only/bash.md",
+                                                       "old_str": "a", "new_str": "b"}, 1)]),
+                ]}]))
+        oo = tmp / "only_out"
+        run(EXTRACTOR, only, "--extract", "1", "--output", oo)
+        odoc2 = json.loads((oo / "files" / "Alpha" / "_manifest.json").read_text(encoding="utf-8"))
+        check("a conversation that produced no files still records its orphan edits",
+              odoc2["files"] == [] and odoc2["orphaned_edits"][0]["path"] == "/only/bash.md")
+
+        # And a conversation that touched no files at all gets no folder — the record is
+        # complete without being noisy.
+        quiet = tmp / "quiet_out"
+        run(EXTRACTOR, zip_path, "--extract", "1", "--output", quiet)
+        check("a conversation with no file activity gets no files folder",
+              not (quiet / "files").exists())
+
+        # An orphan sharing a base name with a file we did write is probably an edit to that
+        # file under another path. Still not applied — but the file says so, rather than
+        # leaving a reader to match names across two lists.
+        suspect = tmp / "suspect_orphans.zip"
+        with zipfile.ZipFile(suspect, "w") as zf:
+            zf.writestr("projects.json", json.dumps([{
+                "uuid": "p-1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "description": "", "prompt_template": "", "docs": []}]))
+            zf.writestr("conversations.json", json.dumps([{
+                "uuid": "c1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "chat_messages": [
+                    assistant(1, [tool("create_file", {"path": "/repo/a.md",
+                                                       "file_text": "hello\n"}, 1),
+                                  tool("str_replace", {"path": "a.md", "old_str": "hello",
+                                                       "new_str": "HELLO"}, 2),
+                                  tool("str_replace", {"path": "/other/a.md", "old_str": "x",
+                                                       "new_str": "y"}, 3)]),
+                    assistant(2, [tool("create_file", {"path": "/repo/clean.md",
+                                                       "file_text": "untouched\n"}, 4)]),
+                    assistant(3, [tool("str_replace", {"path": "/never/seen.md",
+                                                       "old_str": "p", "new_str": "q"}, 5)]),
+                ]}]))
+        sout = tmp / "suspect_out"
+        run(EXTRACTOR, suspect, "--extract", "1", "--output", sout)
+        sdoc = json.loads((sout / "files" / "Alpha" / "_manifest.json").read_text(encoding="utf-8"))
+        entries = {e["file"]: e for e in sdoc["files"]}
+        check("a file is told when orphan edits name it at another path",
+              entries["a.md"].get("orphan_edits_may_target_this") == 2,
+              "both a.md and /other/a.md share its base name")
+        check("a file no orphan resembles is left alone",
+              "orphan_edits_may_target_this" not in entries["clean.md"])
+        check("the suspicion does not change what was applied, or the complete flag",
+              (sout / "files" / "Alpha" / "a.md").read_text(encoding="utf-8") == "hello\n"
+              and entries["a.md"]["complete"] is True
+              and entries["a.md"]["edits_applied"] == 0,
+              "narrow by design: complete means every edit keyed to this path applied")
+        check("an orphan resembling nothing written is attributed to no file",
+              all("orphan_edits_may_target_this" not in e for e in sdoc["files"]
+                  if e["file"] == "clean.md")
+              and any(o["path"] == "/never/seen.md" for o in sdoc["orphaned_edits"]))
+        strans = (sout / "conversations" / "Alpha.md").read_text(encoding="utf-8")
+        check("the transcript says it where the file is written, not only in the manifest",
+              "2 further edits in this conversation name a file called a.md" in strans)
+
+        # Hostile shapes, each of which reached the disk in an earlier draft of this work.
+        hostile = tmp / "hostile_files.zip"
+        long_name = "L" * 300
+        with zipfile.ZipFile(hostile, "w") as zf:
+            zf.writestr("projects.json", json.dumps([{
+                "uuid": "p-1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "description": "", "prompt_template": "", "docs": []}]))
+            zf.writestr("conversations.json", json.dumps([{
+                "uuid": "c1", "name": "Alpha", "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z", "chat_messages": [
+                    assistant(1, [tool("create_file", {"path": "../../../../ESCAPED.md",
+                                                       "file_text": "traversal\n"}, 1)]),
+                    assistant(2, [tool("create_file", {"path": f"/q/{long_name}.md",
+                                                       "file_text": "long\n"}, 2)]),
+                    assistant(3, [tool("create_file", {"path": "/a/dup.md",
+                                                       "file_text": "first\n"}, 3)]),
+                    assistant(4, [tool("create_file", {"path": "/b/dup.md",
+                                                       "file_text": "second\n"}, 4)]),
+                    # Three matches, so the edit names no single place to apply itself.
+                    assistant(5, [tool("create_file", {"path": "/c/amb.md",
+                                                       "file_text": "aaa"}, 5),
+                                  tool("str_replace", {"path": "/c/amb.md",
+                                                       "old_str": "a", "new_str": "Z"}, 6)]),
+                    # Shapes that carry no file at all, and must not be mistaken for one.
+                    assistant(6, [tool("create_file", {"path": "/d/x.md", "file_text": 123}, 7),
+                                  tool("create_file", {"path": None, "file_text": "no path"}, 8),
+                                  tool("str_replace", {"path": "/never/seen.md",
+                                                       "old_str": "a", "new_str": "b"}, 9)]),
+                ]}]))
+        hout = tmp / "hostile_out"
+        hproc = run(EXTRACTOR, hostile, "--extract", "1", "--output", hout)
+        hdir = hout / "files" / "Alpha"
+        written = sorted(f.name for f in hdir.glob("*"))
+        check("a path that climbs out of the output directory is reduced to its name",
+              "ESCAPED.md" in written and not (hout.parent / "ESCAPED.md").exists()
+              and not (ROOT / "ESCAPED.md").exists())
+        long_written = [f for f in written if f.startswith("LL")]
+        check("truncating a long filename keeps its extension",
+              len(long_written) == 1 and long_written[0].endswith(".md")
+              and len(long_written[0]) <= 80,
+              f"{long_written}")
+        check("two paths sharing a base name both survive",
+              "dup.md" in written and "dup_1.md" in written)
+        check("an edit matching several places is not guessed at",
+              (hdir / "amb.md").read_text(encoding="utf-8") == "aaa")
+        check("shapes carrying no file are skipped rather than crashing",
+              hproc.returncode == 0 and "x.md" not in written and "seen.md" not in written,
+              f"{written}")
+
         # ── Faithful export ──────────────────────────────────────────────────
         print("\nFaithful export")
         faith = tmp / "faithful"
