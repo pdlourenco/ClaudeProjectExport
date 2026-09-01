@@ -220,11 +220,31 @@ def load_account_files(zip_path: Path) -> dict:
     """
     out = {}
     with zipfile.ZipFile(zip_path, "r") as zf:
-        for name in zf.namelist():
-            if classify_entry(name) != "account":
-                continue
-            out[Path(name).name] = zf.read(name)
+        entries = sorted(name for name in zf.namelist()
+                         if classify_entry(name) == "account" and _path_segments(name))
+        # Two account files can share a base name in different folders. Keying on the base
+        # name alone collapses them into one and lets the archive's entry order pick the
+        # survivor — the property this file no longer allows anywhere else. So a name is
+        # qualified by its folder exactly when it needs to be, decided by counting first
+        # rather than by who arrives second, and users.json stays users.json.
+        shared = defaultdict(int)
+        for name in entries:
+            shared[_path_segments(name)[-1]] += 1
+        for name in entries:
+            parts = _path_segments(name)
+            key = parts[-1]
+            if shared[key] > 1:
+                key = "/".join(parts[-2:])
+            while key in out:
+                key = "/".join(parts)
+            out[key] = zf.read(name)
     return out
+
+
+def _path_segments(name: str) -> list:
+    """A path's segments, with "." and ".." dropped so a key can never climb out."""
+    return [part for part in str(name).replace("\\", "/").split("/")
+            if part and part not in (".", "..")]
 
 
 def _as_projects(blob):
@@ -1233,7 +1253,14 @@ def copy_account_files(zip_path: Path, destination: Path):
     target = Path(destination) / "raw" / "account"
     target.mkdir(parents=True, exist_ok=True)
     for name, blob in account.items():
-        (target / name).write_bytes(blob)
+        # Segments are sanitized on the way out as well as on the way in: the key came
+        # from an archive, and an archive is not a trustworthy source of file paths.
+        segments = [safe_name(part) for part in _path_segments(name)]
+        out_path = target.joinpath(*segments) if segments else None
+        if out_path is None:
+            continue
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(blob)
     print(f"\nAccount files -> {target}")
     print(f"  {', '.join(sorted(account))}")
 

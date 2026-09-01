@@ -146,6 +146,21 @@ def write_per_conversation(path: Path):
     return path
 
 
+def write_colliding_account(path: Path, reverse=False):
+    """Two account files sharing a base name in different folders."""
+    extra = [("memories/a.json", json.dumps({"which": "memories"})),
+             ("settings/a.json", json.dumps({"which": "settings"}))]
+    if reverse:
+        extra.reverse()
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for proj in PROJECTS:
+            zf.writestr(f"projects/{proj['uuid']}.json", json.dumps(proj, indent=2))
+        zf.writestr("conversations.json", json.dumps(CONVERSATIONS, indent=2))
+        for name, body in extra:
+            zf.writestr(name, body)
+    return path
+
+
 def account_files(zip_path):
     """The account-level files the extractor would carry across with --faithful."""
     spec = importlib.util.spec_from_file_location("cpe", EXTRACTOR)
@@ -196,6 +211,14 @@ def main():
           str(account_files(tmp / "nested.zip")))
     check("a project file is never mistaken for the conversation list",
           all(p["conv_count"] >= 0 for p in nested) and len(nested) == len(PROJECTS))
+
+    collide_a = write_colliding_account(tmp / "acct.zip")
+    collide_b = write_colliding_account(tmp / "acct_rev.zip", reverse=True)
+    check("account files sharing a base name in different folders both survive",
+          account_files(collide_a) == ["memories/a.json", "settings/a.json"],
+          str(account_files(collide_a)))
+    check("and which one survives is not decided by archive order",
+          account_files(collide_a) == account_files(collide_b))
 
     per_conv = index(write_per_conversation(tmp / "per_conv.zip"))
     check("a conversations/<uuid>.json layout loads every conversation",
