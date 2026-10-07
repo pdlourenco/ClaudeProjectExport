@@ -239,6 +239,30 @@ def main():
         check("the index lists documents from both files",
               read(acc / "memory" / "_index.md").count("/areas/dup.md") == 3)
 
+        print("\nA memory path that is another's folder")
+        nested = {"memory_files": [
+            {"path": "/notes", "content": "file first"},
+            {"path": "/notes/inner.md", "content": "folder second"},
+            {"path": "/later/inner.md", "content": "folder first"},
+            {"path": "/later", "content": "file second"},
+        ]}
+        clash = tmp / "clash"
+        proc = run(build_zip(tmp / "k.zip", extra=[("memories/nested.json", json.dumps(nested))]), clash, mapping)
+        check("the run completes", proc.returncode == 0, proc.stderr.strip()[-200:])
+        docs = clash / "unfiled" / "account" / "memory" / "documents"
+        check("a file named like a folder is written beside it",
+              read(docs / "notes" / "inner.md") == "folder second" and read(docs / "notes_1") == "file first")
+        check("whichever order they arrive in",
+              read(docs / "later" / "inner.md") == "folder first" and read(docs / "later_1") == "file second")
+
+        blocked = tmp / "blocked"
+        (blocked / "unfiled").mkdir(parents=True)
+        (blocked / "unfiled" / "account").write_text("in the way", encoding="utf-8")
+        proc = run(build_zip(tmp / "l.zip"), blocked, mapping)
+        check("an account directory that cannot be written is a warning, not the end of the run",
+              proc.returncode == 0 and "WARNING: Could not write the account files" in proc.stderr
+              and (blocked / "proj" / "project_knowledge" / "_project_metadata.json").exists(), proc.stderr.strip()[-200:])
+
         print("\nThe older memories.json layout")
         legacy = tmp / "legacy"
         with zipfile.ZipFile(tmp / "i.zip", "w") as zf:

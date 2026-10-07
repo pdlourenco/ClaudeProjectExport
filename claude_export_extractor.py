@@ -1755,9 +1755,15 @@ def write_account_output(zip_path: Path, destination: Path, project_names, faith
     """Write everything account-level into destination: the rendered documents, and under
     --faithful the raw files too. The archive is read once for both."""
     account = load_account_files(zip_path)
-    if faithful:
-        copy_account_files(account, destination)
-    write_account_documents(account, destination, project_names)
+    try:
+        if faithful:
+            copy_account_files(account, destination)
+        write_account_documents(account, destination, project_names)
+    except OSError as exc:
+        # Account files are not project data, so failing to write them is reported and the
+        # projects are still extracted, rather than ending the run before any project is.
+        print(f"WARNING: Could not write the account files to {destination}: {exc}",
+              file=sys.stderr)
 
 
 def copy_account_files(account: dict, destination: Path):
@@ -1894,13 +1900,13 @@ class _AccountDocuments:
         self.counts = {"reflections": 0, "feedback": 0, "summary": 0,
                        "project_memories": 0, "memory_files": 0}
         self.allocators = {}
-        self.feedback, self.summaries, self.index = [], [], []
+        self.feedback, self.summaries, self.index, self.memory_files = [], [], [], []
         self.unnamed = 0
 
-    def allocate(self, folder: Path, filename: str) -> Path:
+    def allocate(self, folder: Path, filename: str, reserved=()) -> Path:
         if folder not in self.allocators:
             folder.mkdir(parents=True, exist_ok=True)
-            self.allocators[folder] = NameAllocator(folder)
+            self.allocators[folder] = NameAllocator(folder, reserved)
         return self.allocators[folder].allocate(filename)
 
     def add_reflections(self, blob):
@@ -1943,26 +1949,41 @@ class _AccountDocuments:
 
         files = blob.get("memory_files")
         if isinstance(files, list):
-            for record in files:
-                if not isinstance(record, dict) or not isinstance(record.get("content"), str):
-                    continue
-                content = record["content"]
-                # The path came from the export, so it is sanitized segment by segment on its
-                # way to disk, and "." and ".." are already gone from _path_segments.
-                segments = _path_segments(record.get("path") or "")
-                if segments:
-                    folders, filename = [safe_name(p) for p in segments[:-1]], safe_filename(segments[-1])
-                else:
-                    self.unnamed += 1
-                    folders, filename = [], f"memory_{self.unnamed}.md"
-                out_path = self.allocate((directory / "documents").joinpath(*folders), filename)
-                out_path.write_text(content, encoding="utf-8", errors="backslashreplace")
-                self.index.append((record.get("path") or "(no path)", record.get("updated_at") or "",
-                                   len(content)))
-                self.counts["memory_files"] += 1
+            # Written in finish(), once every folder is known: a memory file's path can be
+            # another's folder ("notes" and "notes/x.md"), and whichever came first would
+            # otherwise leave the other a file where it needs a folder, or the reverse.
+            self.memory_files.extend(r for r in files
+                                     if isinstance(r, dict) and isinstance(r.get("content"), str))
+
+    def _write_memory_files(self):
+        documents = self.root / "memory" / "documents"
+        placed = []
+        for record in self.memory_files:
+            # The path came from the export, so it is sanitized segment by segment on its
+            # way to disk, and "." and ".." are already gone from _path_segments.
+            segments = _path_segments(record.get("path") or "")
+            if segments:
+                folders, filename = tuple(safe_name(p) for p in segments[:-1]), safe_filename(segments[-1])
+            else:
+                self.unnamed += 1
+                folders, filename = (), f"memory_{self.unnamed}.md"
+            placed.append((record, folders, filename))
+        # Every folder some file needs, so that no file is handed a folder's name.
+        subfolders = defaultdict(set)
+        for _, folders, _ in placed:
+            for depth in range(len(folders)):
+                subfolders[folders[:depth]].add(folders[depth])
+        for record, folders, filename in placed:
+            out_path = self.allocate(documents.joinpath(*folders), filename,
+                                     reserved=subfolders[folders])
+            out_path.write_text(record["content"], encoding="utf-8", errors="backslashreplace")
+            self.index.append((record.get("path") or "(no path)", record.get("updated_at") or "",
+                               len(record["content"])))
+            self.counts["memory_files"] += 1
 
     def finish(self):
         """Write the files that collect something from every account file."""
+        self._write_memory_files()
         if self.feedback:
             # Nothing is known of this list's shape beyond it being a list, so it is shown as
             # what it is rather than rendered as something it might not be.
