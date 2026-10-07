@@ -1917,6 +1917,11 @@ def render_reflection(entry) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _table_cell(text: str) -> str:
+    """Escape what would end a markdown table cell or row early."""
+    return " ".join(text.replace("|", "\\|").split())
+
+
 class _AccountDocuments:
     """Writes the account documents of every account file into one account/ directory.
 
@@ -2011,8 +2016,9 @@ class _AccountDocuments:
             out_path = self.allocate(documents.joinpath(*folders), filename,
                                      reserved=subfolders[folders])
             out_path.write_text(record["content"], encoding="utf-8", errors="backslashreplace")
-            self.index.append((record.get("path") or "(no path)", record.get("updated_at") or "",
-                               len(record["content"])))
+            # Strings, whatever the export held, so the index sorts and renders as text.
+            self.index.append((str(record.get("path") or "(no path)"),
+                               str(ts(record.get("updated_at") or "")), len(record["content"])))
             self.counts["memory_files"] += 1
 
     def finish(self):
@@ -2034,8 +2040,7 @@ class _AccountDocuments:
                 encoding="utf-8", errors="backslashreplace")
         if self.index:
             rows = ["# Memory documents\n", "| Path | Updated | Characters |", "|---|---|---|"]
-            rows += [f"| {p.replace('|', chr(92) + '|')} | {ts(u)} | {c} |"
-                     for p, u, c in sorted(self.index)]
+            rows += [f"| {_table_cell(p)} | {_table_cell(u)} | {c} |" for p, u, c in sorted(self.index)]
             directory.mkdir(parents=True, exist_ok=True)
             (directory / "_index.md").write_text("\n".join(rows) + "\n", encoding="utf-8",
                                                  errors="backslashreplace")

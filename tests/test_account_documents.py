@@ -293,6 +293,20 @@ def main():
         check("--faithful still writes it beside the first project",
               "vegetable garden" in read(everything / "account" / "memory" / "conversations_memory.md"))
 
+        print("\nMemory records in odd shapes")
+        odd_records = {"memory_files": [
+            {"path": ["a", "list"], "content": "list path", "updated_at": 5},
+            {"path": 42, "content": "number path"},
+            {"path": "/two\nlines|piped.md", "content": "newline path", "updated_at": "bad\ndate"},
+        ]}
+        shaped = tmp / "shaped"
+        proc = run(build_zip(tmp / "m.zip", extra=[("memories/odd.json", json.dumps(odd_records))]), shaped, mapping)
+        check("a path that is not a string does not end the run", proc.returncode == 0, proc.stderr.strip()[-200:])
+        rows = [r for r in read(shaped / "unfiled" / "account" / "memory" / "_index.md").splitlines()
+                if r.startswith("| ") and "Path" not in r]
+        check("every document gets exactly one index row, newlines and pipes notwithstanding",
+              len(rows) == 4 + 3 and all(r.count(" | ") == 2 for r in rows), "\n".join(rows))
+
         print("\nThe older memories.json layout")
         legacy = tmp / "legacy"
         with zipfile.ZipFile(tmp / "i.zip", "w") as zf:
