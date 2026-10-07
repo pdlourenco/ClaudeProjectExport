@@ -35,6 +35,9 @@ used as context for Claude Code work.
   raw/                        # Only with --faithful; the source records, verbatim
 ```
 
+Account-level documents — monthly reflections and memory — are written once, under `account/` in
+the `--unfiled` directory (or beside the first project), whether or not `--faithful` is set.
+
 ## The one thing to get right
 
 The export format carries **no link between a conversation and its project**. Left to itself the

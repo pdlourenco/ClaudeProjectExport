@@ -46,6 +46,7 @@ That's it. No `pip install`, no virtual environment, no config file.
 | `projects/<uuid>.json` | One file per project — knowledge docs and prompt template |
 | `projects.json` | Older exports instead ship a single file holding every project |
 | `memories.json`, or `memories/<uuid>.json` | Saved memories |
+| `reflections/<uuid>.json` | Monthly reflections on how you used Claude (newer exports; the export's manifest calls this category `feedback`), plus a `feedback` list |
 | `users.json` | Account info |
 | `login_history.json` | Sign-in history (not used by this tool) |
 
@@ -165,8 +166,34 @@ python claude_export_extractor.py export.zip --mapping mapping.json --unfiled ./
 _unfiled/
 ├── Weeknight dinner ideas.md
 ├── Quick API question.md
-└── attachments/                # text extracted from attachments, if any
+├── attachments/                # text extracted from attachments, if any
+└── account/                    # reflections and memory — see below
 ```
+
+### Account-level documents
+
+Reflections and memory belong to your account rather than to any project, so they are written
+once — into the `--unfiled` directory if you gave one, otherwise beside the first project —
+under `account/`. They are written by default, not only with `--faithful`:
+
+```
+account/
+├── reflections/
+│   └── 2026-08.md              # one file per month: summary, stats, topics, and the prose sections
+├── feedback.md                 # only if the export's feedback list is not empty
+└── memory/
+    ├── conversations_memory.md # the summary Claude keeps of your conversations
+    ├── project_memories/
+    │   └── My Project.md       # one per project, named after it
+    ├── documents/              # the memory files, at the paths Claude knows them by
+    │   └── projects/<uuid>/ways-of-working.md
+    └── _index.md               # every memory document, when it was last updated, and its size
+```
+
+These are recognised by what they contain, not by what the file is called — the export has
+already renamed one category. An account file the tool has no renderer for is named in a note on
+stderr rather than passed over; `--faithful` keeps it verbatim under `raw/account/`. `users.json`
+and `login_history.json` are identity and sign-in records and are only ever kept raw.
 
 ## How Conversation Matching Works
 
@@ -467,11 +494,14 @@ own summary, and the reply-threading ids.
 `--faithful` does two things about that:
 
 - **Renders the parts worth reading** into the transcripts — tool calls and their results
-  including failures, cited sources, the conversation summary, names of non-text files — and
-  the condensed reasoning summaries into `thinking/`. It implies `--thinking`.
+  including failures, the documents a memory read returned, image-search results, the text the
+  platform injected before the model saw a message (the date, a suffix, the memory it was
+  given), cited sources, the conversation summary, names of non-text files, and any content
+  block of a type this tool has no renderer for — and the condensed reasoning summaries into
+  `thinking/`. It implies `--thinking`.
 - **Writes every source record verbatim** to `raw/`, one JSON file per conversation under the
   same filename as its transcript, plus `raw/project.json` and the account-level files
-  (`users.json`, `memories.json`, `login_history.json`) under `raw/account/`.
+  (`users.json`, `memories.json`, `reflections/…`, `login_history.json`) under `raw/account/`.
 
 ```
 <output_dir>/
@@ -480,7 +510,7 @@ own summary, and the reply-threading ids.
 ├── thinking/        Weekly sync.md
 └── raw/
     ├── project.json
-    ├── account/     users.json, memories.json, login_history.json
+    ├── account/     users.json, memories/…, reflections/…, login_history.json
     └── conversations/  Weekly sync.json     # the source record, untouched
 ```
 
@@ -492,6 +522,14 @@ extraction without needing a code change.
 Account-level files are written once, into the `--unfiled` directory if you gave one and
 otherwise beside the first project, since they aren't project data and copying them into every
 folder would be duplication rather than completeness.
+
+### Does it work on Windows with long names?
+
+Yes. A document Claude wrote is filed under `files/<conversation title>/<file name>`, with up to
+80 characters in each of the last two parts, so a modest output directory is enough to pass
+Windows' 260-character path limit. The extractor writes through extended-length paths on
+Windows, so one long name no longer ends the run. Other tools may still struggle with such
+paths: Git for Windows needs `core.longpaths` set, and Explorer can't always open them.
 
 ### Does this work with Claude.ai Team/Enterprise exports?
 
