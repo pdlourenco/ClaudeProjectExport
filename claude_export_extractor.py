@@ -1846,6 +1846,16 @@ def _render_section_items(items) -> list:
     return lines
 
 
+def _render_value(value) -> list:
+    """Render a section's value whatever its shape: prose as prose, a list as records, and
+    anything else as JSON — so a section in an unexpected shape is shown, not skipped."""
+    if isinstance(value, str):
+        return [value.strip(), ""]
+    if isinstance(value, list):
+        return _render_section_items(value)
+    return [*_fence(json.dumps(value, indent=2, ensure_ascii=False), "json"), ""]
+
+
 def render_reflection(entry) -> str:
     """One month's reflection as markdown. Tolerates any section being absent."""
     content = entry.get("content") if isinstance(entry.get("content"), dict) else {}
@@ -1859,42 +1869,51 @@ def render_reflection(entry) -> str:
         lines.extend(["", _as_text(content["hero_body"])])
     lines.append("")
 
+    # A known section in a shape other than the one expected — a dict of stats, prose
+    # where a list was, plain strings for topics — is rendered generically, not dropped.
     stats = content.get("stats")
-    if isinstance(stats, list) and stats:
+    if stats not in (None, "", [], {}):
         lines.extend(["## Stats", ""])
-        for s in stats:
-            if isinstance(s, dict):
-                tail = f" — {s['sublabel']}" if s.get("sublabel") else ""
-                lines.append(f"- **{s.get('n', '')}** {s.get('label', '')}{tail}".rstrip())
-        lines.append("")
+        if isinstance(stats, list):
+            for s in stats:
+                if isinstance(s, dict):
+                    tail = f" — {s['sublabel']}" if s.get("sublabel") else ""
+                    lines.append(f"- **{s.get('n', '')}** {s.get('label', '')}{tail}".rstrip())
+                else:
+                    lines.append(f"- {s}")
+            lines.append("")
+        else:
+            lines.extend(_render_value(stats))
 
     topics = content.get("topics")
-    if isinstance(topics, list) and topics:
+    if topics not in (None, "", [], {}):
         lines.extend(["## Topics", ""])
-        for t in topics:
-            if isinstance(t, dict):
-                pct = f" ({t['percent']}%)" if t.get("percent") is not None else ""
-                desc = f" — {_as_text(t.get('description'))}" if _as_text(t.get("description")) else ""
-                lines.append(f"- **{_as_text(t.get('title')) or '(untitled)'}**{pct}{desc}")
-        lines.append("")
+        if isinstance(topics, list):
+            for t in topics:
+                if isinstance(t, dict):
+                    pct = f" ({t['percent']}%)" if t.get("percent") is not None else ""
+                    desc = f" — {_as_text(t.get('description'))}" if _as_text(t.get("description")) else ""
+                    lines.append(f"- **{_as_text(t.get('title')) or '(untitled)'}**{pct}{desc}")
+                else:
+                    lines.append(f"- {t}")
+            lines.append("")
+        else:
+            lines.extend(_render_value(topics))
 
     for key, heading in REFLECTION_HEADINGS.items():
         if key in ("stats", "topics"):
             continue
-        items = content.get(key)
-        if isinstance(items, list) and items:
+        value = content.get(key)
+        if value not in (None, "", [], {}):
             lines.extend([f"## {heading}", ""])
-            lines.extend(_render_section_items(items))
+            lines.extend(_render_value(value))
 
     known = set(REFLECTION_HEADINGS) | set(REFLECTION_SCALARS)
     for key, value in content.items():
         if key in known or value in (None, "", [], {}):
             continue
         lines.extend([f"## {key.replace('_', ' ').capitalize()}", ""])
-        if isinstance(value, list):
-            lines.extend(_render_section_items(value))
-        else:
-            lines.extend([*_fence(json.dumps(value, indent=2, ensure_ascii=False), "json"), ""])
+        lines.extend(_render_value(value))
     return "\n".join(lines).rstrip() + "\n"
 
 

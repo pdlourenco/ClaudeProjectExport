@@ -186,6 +186,19 @@ def main():
         check("a reflection missing every section still renders", text.startswith("# Quiet month"))
         check("and invents no empty headings", "## " not in text)
 
+        shapes = tmp / "shapes"
+        odd_shapes = {"reflections": [{"period": "2026-07", "content": {
+            "hero_title": "Shapes", "stats": {"conversations": 9},
+            "topics": ["Gardening", "Bees"], "about_your_time": "Prose where a list was.",
+            "worth_thinking_about": {"title": "A lone record"}}}], "feedback": []}
+        run(build_zip(tmp / "s.zip", reflection=odd_shapes), shapes, mapping)
+        text = read(shapes / "unfiled" / "account" / "reflections" / "2026-07.md")
+        check("stats in an unexpected shape are shown", '"conversations": 9' in text)
+        check("topics given as plain strings are shown", "- Gardening" in text and "- Bees" in text)
+        check("a prose section given as a string is shown",
+              "## About your time" in text and "Prose where a list was." in text)
+        check("a prose section given as one record is shown", "A lone record" in text)
+
         filled = tmp / "filled"
         item = {"rating": "up", "note": "invented"}
         run(build_zip(tmp / "c.zip", reflection={**REFLECTION, "feedback": [item]}), filled, mapping)
