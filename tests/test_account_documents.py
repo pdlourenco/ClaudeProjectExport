@@ -307,6 +307,16 @@ def main():
         check("every document gets exactly one index row, newlines and pipes notwithstanding",
               len(rows) == 4 + 3 and all(r.count(" | ") == 2 for r in rows), "\n".join(rows))
 
+        print("\nWindows device names")
+        devices = {"memory_files": [{"path": "/aux/con.md", "content": "device names"},
+                                    {"path": "/areas/NUL", "content": "bare device name"}]}
+        dev = tmp / "devices"
+        run(build_zip(tmp / "n.zip", extra=[("memories/devices.json", json.dumps(devices))]), dev, mapping)
+        docs = dev / "unfiled" / "account" / "memory" / "documents"
+        check("a reserved name, as a folder or a file, is written under a usable one",
+              read(docs / "aux_" / "con_.md") == "device names" and read(docs / "areas" / "NUL_") == "bare device name"
+              and not (docs / "aux").exists())
+
         print("\nThe older memories.json layout")
         legacy = tmp / "legacy"
         with zipfile.ZipFile(tmp / "i.zip", "w") as zf:

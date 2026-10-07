@@ -42,6 +42,10 @@ from collections import defaultdict
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+WINDOWS_RESERVED_NAMES = ({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                          | {f"{dev}{n}" for dev in ("COM", "LPT") for n in "0123456789\u00b9\u00b2\u00b3"})
+
+
 def safe_name(name: str, max_len: int = 80) -> str:
     """Sanitize a string for use as a filename."""
     # The surrogate range is here for the same reason as the control characters: JSON
@@ -49,7 +53,15 @@ def safe_name(name: str, max_len: int = 80) -> str:
     name = re.sub(r'[\\/*?:"<>|\x00-\x1f\ud800-\udfff]', "_", name)
     name = re.sub(r"_+", "_", name)
     name = re.sub(r"\s+", " ", name).strip().strip("_. ")
-    return name[:max_len] or "untitled"
+    name = name[:max_len] or "untitled"
+    # Windows reserves these names whatever the extension, and the extended-length paths
+    # the output is written through skip that check: "con.md" becomes a real file that
+    # Explorer and most tools can neither open nor delete. Done everywhere, since output
+    # written elsewhere is often copied to Windows later.
+    base = name.split(".")[0]
+    if base.strip().upper() in WINDOWS_RESERVED_NAMES:
+        name = (base + "_" + name[len(base):])[:max_len]
+    return name
 
 
 def ts(iso: str) -> str:
