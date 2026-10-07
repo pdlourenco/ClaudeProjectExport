@@ -351,6 +351,17 @@ def main():
         check("two memory paths differing only by case are both kept, under names that differ by more than case",
               len({n.casefold() for n in names}) == 2 and {read(areas / n) for n in names} == {"UPPER", "lower"},
               str(sorted(names)))
+        folders_cased = {"memory_files": [{"path": "/Areas/Deep/note.md", "content": "first"},
+                                          {"path": "/areas/deep/note.md", "content": "second"}]}
+        folder_out = tmp / "folder_cased"
+        run(build_zip(tmp / "folder_cased.zip", extra=[("memories/folders.json", json.dumps(folders_cased))]),
+            folder_out, mapping)
+        docs = folder_out / "unfiled" / "account" / "memory" / "documents"
+        written = sorted(str(p.relative_to(docs)) for p in docs.rglob("*")
+                         if p.is_file() and p.parent.name.casefold() == "deep")
+        check("folders differing only by case are one folder, so its files are not handed one name twice",
+              written == [os.path.join("Areas", "Deep", "note.md"), os.path.join("Areas", "Deep", "note_1.md")]
+              and {read(docs / w) for w in written} == {"first", "second"}, str(written))
         spec = importlib.util.spec_from_file_location("extractor_under_test", EXTRACTOR)
         extractor = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(extractor)

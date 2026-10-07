@@ -2024,12 +2024,20 @@ class _AccountDocuments:
     def _write_memory_files(self):
         documents = self.root / "memory" / "documents"
         placed = []
+        # A folder keeps the spelling it was first seen with. Areas/ and areas/ are one folder
+        # on Windows and macOS, and as two they would each hand out note.md, the second
+        # overwriting the first there.
+        spelled = {}
         for record in self.memory_files:
             # The path came from the export, so it is sanitized segment by segment on its
             # way to disk, and "." and ".." are already gone from _path_segments.
             segments = _path_segments(record.get("path") or "")
             if segments:
-                folders, filename = tuple(safe_name(p) for p in segments[:-1]), safe_filename(segments[-1])
+                folders = [safe_name(p) for p in segments[:-1]]
+                folders = tuple(spelled.setdefault(tuple(f.casefold() for f in folders[:depth + 1]),
+                                                   folders[depth])
+                                for depth in range(len(folders)))
+                filename = safe_filename(segments[-1])
             else:
                 self.unnamed += 1
                 folders, filename = (), f"memory_{self.unnamed}.md"
