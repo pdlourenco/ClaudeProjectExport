@@ -2011,14 +2011,19 @@ def write_account_documents(account: dict, destination: Path, project_names=None
         except ValueError:
             unrendered.append(name)
             continue
-        recognised = False
-        if isinstance(data, dict) and ("reflections" in data or "feedback" in data):
-            recognised = True
-            documents.add_reflections(data)
-        if isinstance(data, dict) and any(k in data for k in (
-                "conversations_memory", "project_memories", "memory_files")):
-            recognised = True
-            documents.add_memory(data)
+        # The older memories.json is a list of memory records rather than one record, and
+        # an empty list has nothing in it to lose.
+        records = data if isinstance(data, list) else [data]
+        recognised = not records
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if "reflections" in record or "feedback" in record:
+                recognised = True
+                documents.add_reflections(record)
+            if any(k in record for k in ("conversations_memory", "project_memories", "memory_files")):
+                recognised = True
+                documents.add_memory(record)
         if not recognised:
             unrendered.append(name)
     documents.finish()

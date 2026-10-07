@@ -239,6 +239,27 @@ def main():
         check("the index lists documents from both files",
               read(acc / "memory" / "_index.md").count("/areas/dup.md") == 3)
 
+        print("\nThe older memories.json layout")
+        legacy = tmp / "legacy"
+        with zipfile.ZipFile(tmp / "i.zip", "w") as zf:
+            zf.writestr(f"projects/{PROJECT}.json", json.dumps(project_record()))
+            zf.writestr("conversations.json", json.dumps([CONVERSATION]))
+            zf.writestr("memories.json", json.dumps([{"conversations_memory": "An older summary.",
+                                                       "project_memories": {PROJECT: "Older note."}}]))
+        proc = run(tmp / "i.zip", legacy, mapping)
+        memory_dir = legacy / "unfiled" / "account" / "memory"
+        check("a list of memory records is rendered",
+              "An older summary." in read(memory_dir / "conversations_memory.md")
+              and "Older note." in read(memory_dir / "project_memories" / "Garden.md"))
+        check("and is not reported as unreadable", "memories.json" not in proc.stderr, proc.stderr.strip()[:160])
+        with zipfile.ZipFile(tmp / "j.zip", "w") as zf:
+            zf.writestr(f"projects/{PROJECT}.json", json.dumps(project_record()))
+            zf.writestr("conversations.json", json.dumps([CONVERSATION]))
+            zf.writestr("memories.json", json.dumps([]))
+        proc = run(tmp / "j.zip", tmp / "empty", mapping)
+        check("an empty memories.json is not reported either", "memories.json" not in proc.stderr,
+              proc.stderr.strip()[:160])
+
         print("\nAccount files with nothing to read, and ones with no renderer")
         check("users.json and login_history.json are not rendered",
               not any("users" in p.name or "login" in p.name for p in account.rglob("*")))
