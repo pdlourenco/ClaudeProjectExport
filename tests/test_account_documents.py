@@ -209,6 +209,36 @@ def main():
               {read(memory / "documents" / "areas" / n) for n in ("dup.md", "dup_1.md")} == {"first", "second"})
         check("an index lists them", "/areas/dup.md" in read(memory / "_index.md"))
 
+        print("\nSeveral account files")
+        second_reflection = {"reflections": [{"period": "2026-08", "content": {"hero_title": "Same month, other file"}}],
+                             "feedback": [{"rating": "down"}]}
+        second_memory = {"conversations_memory": "The user also keeps bees.",
+                         "project_memories": {PROJECT: "A second note on the garden."},
+                         "memory_files": [{"path": "/areas/dup.md", "content": "third",
+                                           "updated_at": "2026-09-03T00:00:00Z"}]}
+        several = tmp / "several"
+        proc = run(build_zip(tmp / "h.zip", reflection={**REFLECTION, "feedback": [{"rating": "up"}]},
+                             extra=[("reflections/other.json", json.dumps(second_reflection)),
+                                    ("memories/other.json", json.dumps(second_memory))]),
+                   several, mapping)
+        acc = several / "unfiled" / "account"
+        check("feedback from both files is kept",
+              all(s in read(acc / "feedback.md") for s in ('"up"', '"down"')), proc.stderr.strip()[:200])
+        check("two reflections for one month both survive",
+              {read(acc / "reflections" / n).partition("\n")[0] for n in ("2026-08.md", "2026-08_1.md")}
+              == {"# A month of invented things", "# Same month, other file"})
+        summary = read(acc / "memory" / "conversations_memory.md")
+        check("both conversations summaries are kept", "vegetable garden" in summary and "bees" in summary)
+        check("both notes on one project are kept",
+              {"Track the garden." in read(acc / "memory" / "project_memories" / n) or
+               "A second note" in read(acc / "memory" / "project_memories" / n)
+               for n in ("Garden.md", "Garden_1.md")} == {True})
+        check("memory files from both files share one folder without overwriting",
+              {read(acc / "memory" / "documents" / "areas" / n) for n in ("dup.md", "dup_1.md", "dup_2.md")}
+              == {"first", "second", "third"})
+        check("the index lists documents from both files",
+              read(acc / "memory" / "_index.md").count("/areas/dup.md") == 3)
+
         print("\nAccount files with nothing to read, and ones with no renderer")
         check("users.json and login_history.json are not rendered",
               not any("users" in p.name or "login" in p.name for p in account.rglob("*")))

@@ -1877,96 +1877,113 @@ def render_reflection(entry) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _write_reflections(blob, root: Path) -> dict:
-    """Write each reflection as reflections/<period>.md, and feedback (if any) as feedback.md."""
-    counts = {"reflections": 0, "feedback": 0}
-    entries = blob.get("reflections")
-    entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
-    if entries:
-        directory = root / "reflections"
-        directory.mkdir(parents=True, exist_ok=True)
-        names = NameAllocator(directory)
+class _AccountDocuments:
+    """Writes the account documents of every account file into one account/ directory.
+
+    An export can carry several memory or reflection files (memories/<uuid>.json is one per
+    account), so the output is shared across them: names are handed out by one allocator per
+    directory, and the summary, the feedback and the index — one file each — are collected
+    and written once at the end. Rendering each file on its own let the last one overwrite
+    the others' feedback.md, conversations_memory.md and _index.md, while the totals still
+    counted every one.
+    """
+
+    def __init__(self, root: Path, project_names: dict):
+        self.root = root
+        self.project_names = project_names
+        self.counts = {"reflections": 0, "feedback": 0, "summary": 0,
+                       "project_memories": 0, "memory_files": 0}
+        self.allocators = {}
+        self.feedback, self.summaries, self.index = [], [], []
+        self.unnamed = 0
+
+    def allocate(self, folder: Path, filename: str) -> Path:
+        if folder not in self.allocators:
+            folder.mkdir(parents=True, exist_ok=True)
+            self.allocators[folder] = NameAllocator(folder)
+        return self.allocators[folder].allocate(filename)
+
+    def add_reflections(self, blob):
+        """Each reflection as reflections/<period>.md; the feedback list is kept for finish()."""
+        entries = blob.get("reflections")
+        entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
         for entry in entries:
             content = entry.get("content") if isinstance(entry.get("content"), dict) else {}
             label = (_as_text(entry.get("period")) or _as_text(content.get("period"))
                      or ts_short(entry.get("created_at", "")) or "reflection")
-            names.allocate(safe_name(label) + ".md").write_text(
+            self.allocate(self.root / "reflections", safe_name(label) + ".md").write_text(
                 render_reflection(entry), encoding="utf-8", errors="backslashreplace")
-            counts["reflections"] += 1
+            self.counts["reflections"] += 1
 
-    feedback = blob.get("feedback")
-    if isinstance(feedback, list) and feedback:
-        # Nothing is known of this list's shape beyond it being a list, so it is shown as
-        # what it is rather than rendered as something it might not be.
-        root.mkdir(parents=True, exist_ok=True)
-        text = "# Feedback\n\n" + "\n".join(_fence(json.dumps(feedback, indent=2, ensure_ascii=False), "json")) + "\n"
-        (root / "feedback.md").write_text(text, encoding="utf-8", errors="backslashreplace")
-        counts["feedback"] = len(feedback)
-    return counts
+        feedback = blob.get("feedback")
+        if isinstance(feedback, list):
+            self.feedback.extend(feedback)
+            self.counts["feedback"] += len(feedback)
 
+    def add_memory(self, blob):
+        """The summary, per-project notes, and the memory files of one memory record."""
+        directory = self.root / "memory"
 
-def _write_memory(blob, root: Path, project_names: dict) -> dict:
-    """Write the account's memory: the summary, per-project notes, and the memory files."""
-    counts = {"summary": 0, "project_memories": 0, "memory_files": 0}
-    directory = root / "memory"
+        summary = _as_text(blob.get("conversations_memory"))
+        if summary:
+            self.summaries.append(summary)
+            self.counts["summary"] += 1
 
-    summary = _as_text(blob.get("conversations_memory"))
-    if summary:
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / "conversations_memory.md").write_text(
-            "# Conversations memory\n\n" + summary + "\n", encoding="utf-8",
-            errors="backslashreplace")
-        counts["summary"] = 1
+        projects = blob.get("project_memories")
+        if isinstance(projects, dict):
+            for uuid, text in projects.items():
+                body = text if isinstance(text, str) else json.dumps(text, indent=2, ensure_ascii=False)
+                if not body.strip():
+                    continue
+                label = self.project_names.get(uuid) or str(uuid)
+                self.allocate(directory / "project_memories", safe_name(label) + ".md").write_text(
+                    f"# Memory — {label}\n\n- **Project:** {uuid}\n\n{body.strip()}\n",
+                    encoding="utf-8", errors="backslashreplace")
+                self.counts["project_memories"] += 1
 
-    projects = blob.get("project_memories")
-    if isinstance(projects, dict):
-        folder = directory / "project_memories"
-        names = None
-        for uuid, text in projects.items():
-            body = text if isinstance(text, str) else json.dumps(text, indent=2, ensure_ascii=False)
-            if not body.strip():
-                continue
-            if names is None:
-                folder.mkdir(parents=True, exist_ok=True)
-                names = NameAllocator(folder)
-            label = project_names.get(uuid) or str(uuid)
-            names.allocate(safe_name(label) + ".md").write_text(
-                f"# Memory — {label}\n\n- **Project:** {uuid}\n\n{body.strip()}\n",
+        files = blob.get("memory_files")
+        if isinstance(files, list):
+            for record in files:
+                if not isinstance(record, dict) or not isinstance(record.get("content"), str):
+                    continue
+                content = record["content"]
+                # The path came from the export, so it is sanitized segment by segment on its
+                # way to disk, and "." and ".." are already gone from _path_segments.
+                segments = _path_segments(record.get("path") or "")
+                if segments:
+                    folders, filename = [safe_name(p) for p in segments[:-1]], safe_filename(segments[-1])
+                else:
+                    self.unnamed += 1
+                    folders, filename = [], f"memory_{self.unnamed}.md"
+                out_path = self.allocate((directory / "documents").joinpath(*folders), filename)
+                out_path.write_text(content, encoding="utf-8", errors="backslashreplace")
+                self.index.append((record.get("path") or "(no path)", record.get("updated_at") or "",
+                                   len(content)))
+                self.counts["memory_files"] += 1
+
+    def finish(self):
+        """Write the files that collect something from every account file."""
+        if self.feedback:
+            # Nothing is known of this list's shape beyond it being a list, so it is shown as
+            # what it is rather than rendered as something it might not be.
+            self.root.mkdir(parents=True, exist_ok=True)
+            text = ("# Feedback\n\n"
+                    + "\n".join(_fence(json.dumps(self.feedback, indent=2, ensure_ascii=False), "json"))
+                    + "\n")
+            (self.root / "feedback.md").write_text(text, encoding="utf-8", errors="backslashreplace")
+        directory = self.root / "memory"
+        if self.summaries:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "conversations_memory.md").write_text(
+                "# Conversations memory\n\n" + "\n\n---\n\n".join(self.summaries) + "\n",
                 encoding="utf-8", errors="backslashreplace")
-            counts["project_memories"] += 1
-
-    files = blob.get("memory_files")
-    if isinstance(files, list):
-        documents = directory / "documents"
-        allocators = {}
-        index = []
-        for n, record in enumerate((f for f in files if isinstance(f, dict)), 1):
-            content = record.get("content")
-            if not isinstance(content, str):
-                continue
-            # The path came from the export, so it is sanitized segment by segment on its
-            # way to disk, and "." and ".." are already gone from _path_segments.
-            segments = _path_segments(record.get("path") or "")
-            if segments:
-                folders, filename = [safe_name(p) for p in segments[:-1]], safe_filename(segments[-1])
-            else:
-                folders, filename = [], f"memory_{n}.md"
-            folder = documents.joinpath(*folders)
-            if folder not in allocators:
-                folder.mkdir(parents=True, exist_ok=True)
-                allocators[folder] = NameAllocator(folder)
-            out_path = allocators[folder].allocate(filename)
-            out_path.write_text(content, encoding="utf-8", errors="backslashreplace")
-            index.append((record.get("path") or "(no path)", record.get("updated_at") or "",
-                          len(content)))
-            counts["memory_files"] += 1
-        if index:
+        if self.index:
             rows = ["# Memory documents\n", "| Path | Updated | Characters |", "|---|---|---|"]
             rows += [f"| {p.replace('|', chr(92) + '|')} | {ts(u)} | {c} |"
-                     for p, u, c in sorted(index)]
+                     for p, u, c in sorted(self.index)]
+            directory.mkdir(parents=True, exist_ok=True)
             (directory / "_index.md").write_text("\n".join(rows) + "\n", encoding="utf-8",
                                                  errors="backslashreplace")
-    return counts
 
 
 def write_account_documents(account: dict, destination: Path, project_names=None) -> dict:
@@ -1982,10 +1999,9 @@ def write_account_documents(account: dict, destination: Path, project_names=None
     A file with no renderer is named in a note rather than passed over, because without
     --faithful nothing else keeps it.
     """
-    root = _extended(destination) / "account"
     shown = Path(destination) / "account"
-    project_names = project_names or {}
-    totals, unrendered = {}, []
+    documents = _AccountDocuments(_extended(destination) / "account", project_names or {})
+    unrendered = []
 
     for name, blob in account.items():
         if Path(name).name in RAW_ONLY_ACCOUNT_FILES:
@@ -1998,16 +2014,16 @@ def write_account_documents(account: dict, destination: Path, project_names=None
         recognised = False
         if isinstance(data, dict) and ("reflections" in data or "feedback" in data):
             recognised = True
-            for key, n in _write_reflections(data, root).items():
-                totals[key] = totals.get(key, 0) + n
+            documents.add_reflections(data)
         if isinstance(data, dict) and any(k in data for k in (
                 "conversations_memory", "project_memories", "memory_files")):
             recognised = True
-            for key, n in _write_memory(data, root, project_names).items():
-                totals[key] = totals.get(key, 0) + n
+            documents.add_memory(data)
         if not recognised:
             unrendered.append(name)
+    documents.finish()
 
+    totals = documents.counts
     if any(totals.values()):
         print(f"\nAccount documents -> {shown}")
         print("  " + ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in totals.items() if n))
