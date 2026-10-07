@@ -280,10 +280,10 @@ def main():
         print("\nEach project's own memory, and only its own")
         other = {"project_memories": {"b0000000-0000-4000-8000-000000000009": "Another project's secret."},
                  "conversations_memory": "An account-wide summary."}
-        build_zip(tmp / "p.zip", extra=[("memories/other.json", json.dumps(other))])
+        build_zip(tmp / "own_memory.zip", extra=[("memories/other.json", json.dumps(other))])
         def run_into_project(out, *flags):
             return subprocess.run(
-                [sys.executable, str(EXTRACTOR), str(tmp / "p.zip"), "--extract", "1",
+                [sys.executable, str(EXTRACTOR), str(tmp / "own_memory.zip"), "--extract", "1",
                  "--output", str(out), *flags],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 env={**os.environ, "PYTHONIOENCODING": "utf-8"})
@@ -299,7 +299,7 @@ def main():
               and "vegetable garden" not in everything_written and "account-wide summary" not in everything_written)
         check("and the note says how to get the rest", "--unfiled DIR" in proc.stderr)
         with_bucket = tmp / "with_bucket"
-        run(tmp / "p.zip", with_bucket, mapping)
+        run(tmp / "own_memory.zip", with_bucket, mapping)
         check("the project note is written with --unfiled too",
               "Track the garden." in read(with_bucket / "proj" / "project_knowledge" / "_project_memory.md"))
         check("while the bucket holds every project's notes",
@@ -345,7 +345,7 @@ def main():
         cased = {"memory_files": [{"path": "/areas/Case.md", "content": "UPPER"},
                                   {"path": "/areas/case.md", "content": "lower"}]}
         cased_out = tmp / "cased"
-        run(build_zip(tmp / "o.zip", extra=[("memories/cased.json", json.dumps(cased))]), cased_out, mapping)
+        run(build_zip(tmp / "case_names.zip", extra=[("memories/cased.json", json.dumps(cased))]), cased_out, mapping)
         areas = cased_out / "unfiled" / "account" / "memory" / "documents" / "areas"
         names = [p.name for p in areas.iterdir() if p.name.casefold().startswith("case")]
         check("two memory paths differing only by case are both kept, under names that differ by more than case",
@@ -372,11 +372,11 @@ def main():
 
         print("\nA null project memory")
         nulls = tmp / "nulls"
-        with zipfile.ZipFile(tmp / "p.zip", "w") as zf:
+        with zipfile.ZipFile(tmp / "null_memory.zip", "w") as zf:
             zf.writestr(f"projects/{PROJECT}.json", json.dumps(project_record()))
             zf.writestr("conversations.json", json.dumps([CONVERSATION]))
             zf.writestr("memories.json", json.dumps({"project_memories": {PROJECT: None, "other": {}, "blank": "  "}}))
-        run(tmp / "p.zip", nulls, mapping)
+        run(tmp / "null_memory.zip", nulls, mapping)
         check("is not written as a note reading \"null\"",
               not (nulls / "proj" / "project_knowledge" / "_project_memory.md").exists())
         check("nor as a project memory under account/",
@@ -442,10 +442,10 @@ def main():
                 "chat_messages": [message("m9", "assistant", "Cited.", {
                     "type": "text", "text": "Cited.",
                     "citations": [{"url": "https://cite.example/a", "title": "A cited page"}]})]}
-        with zipfile.ZipFile(tmp / "o.zip", "w") as zf:
+        with zipfile.ZipFile(tmp / "lone_block.zip", "w") as zf:
             zf.writestr(f"projects/{PROJECT}.json", json.dumps(project_record()))
             zf.writestr("conversations.json", json.dumps([lone]))
-        run(tmp / "o.zip", tmp / "lone", mapping, "--faithful")
+        run(tmp / "lone_block.zip", tmp / "lone", mapping, "--faithful")
         check("a message whose content is one block still shows its sources",
               "[A cited page](https://cite.example/a)" in read(tmp / "lone" / "unfiled" / "Lone block.md"))
 
