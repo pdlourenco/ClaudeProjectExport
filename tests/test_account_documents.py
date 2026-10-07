@@ -293,10 +293,13 @@ def main():
         check("an unrecognised account file is named in a note", "invoices.json" in proc.stderr, proc.stderr.strip()[:160])
         check("and is not rendered", not list((odd / "unfiled" / "account").rglob("invoices*")))
         kept = tmp / "kept"
-        run(build_zip(tmp / "e.zip", extra=[("billing/invoices.json", json.dumps({"rows": [1]}))]),
-            kept, mapping, "--faithful")
+        proc = run(build_zip(tmp / "e.zip", extra=[("billing/invoices.json", json.dumps({"rows": [1]}))]),
+                   kept, mapping, "--faithful")
         check("under --faithful it is kept verbatim",
               list((kept / "unfiled" / "raw" / "account").rglob("invoices.json")) != [])
+        check("and the note says so rather than asking for --faithful",
+              "invoices.json" in proc.stderr and "Pass --faithful" not in proc.stderr
+              and "kept verbatim under raw/account/" in proc.stderr, proc.stderr.strip()[-160:])
 
         print("\nTranscripts")
         faithful = tmp / "faithful"

@@ -1758,7 +1758,7 @@ def write_account_output(zip_path: Path, destination: Path, project_names, faith
     try:
         if faithful:
             copy_account_files(account, destination)
-        write_account_documents(account, destination, project_names)
+        write_account_documents(account, destination, project_names, faithful)
     except OSError as exc:
         # Account files are not project data, so failing to write them is reported and the
         # projects are still extracted, rather than ending the run before any project is.
@@ -2007,7 +2007,8 @@ class _AccountDocuments:
                                                  errors="backslashreplace")
 
 
-def write_account_documents(account: dict, destination: Path, project_names=None) -> dict:
+def write_account_documents(account: dict, destination: Path, project_names=None,
+                            faithful: bool = False) -> dict:
     """Render the account-level files that have something to read, once, into destination.
 
     Reflections and memory are account data, not project data, so like the raw account
@@ -2054,8 +2055,10 @@ def write_account_documents(account: dict, destination: Path, project_names=None
         print(f"\nAccount documents -> {shown}")
         print("  " + ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in totals.items() if n))
     if unrendered:
+        kept = ("They are kept verbatim under raw/account/." if faithful
+                else "Pass --faithful to keep them verbatim under raw/account/.")
         print(f"\nNOTE: no readable rendering for account file(s): {', '.join(sorted(unrendered))}. "
-              f"Pass --faithful to keep them verbatim under raw/account/.", file=sys.stderr)
+              f"{kept}", file=sys.stderr)
     return totals
 
 
