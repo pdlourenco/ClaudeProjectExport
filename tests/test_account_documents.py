@@ -14,6 +14,7 @@ Self-contained: no framework, no fixtures on disk, no dependencies. Every name a
 below is invented.
 """
 
+import importlib.util
 import json
 import os
 import shutil
@@ -339,6 +340,36 @@ def main():
         check("a reserved name, as a folder or a file, is written under a usable one",
               read(docs / "aux_" / "con_.md") == "device names" and read(docs / "areas" / "NUL_") == "bare device name"
               and not (docs / "aux").exists())
+
+        print("\nNames that differ only by case")
+        cased = {"memory_files": [{"path": "/areas/Case.md", "content": "UPPER"},
+                                  {"path": "/areas/case.md", "content": "lower"}]}
+        cased_out = tmp / "cased"
+        run(build_zip(tmp / "o.zip", extra=[("memories/cased.json", json.dumps(cased))]), cased_out, mapping)
+        areas = cased_out / "unfiled" / "account" / "memory" / "documents" / "areas"
+        names = [p.name for p in areas.iterdir() if p.name.casefold().startswith("case")]
+        check("two memory paths differing only by case are both kept, under names that differ by more than case",
+              len({n.casefold() for n in names}) == 2 and {read(areas / n) for n in names} == {"UPPER", "lower"},
+              str(sorted(names)))
+        spec = importlib.util.spec_from_file_location("extractor_under_test", EXTRACTOR)
+        extractor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(extractor)
+        allocator = extractor.NameAllocator(tmp, reserved=("Taken.md",))
+        handed = [allocator.allocate(n).name for n in ("Notes.md", "notes.md", "NOTES.md", "taken.md")]
+        check("the allocator never hands out two names that are one file on a case-insensitive filesystem",
+              len({n.casefold() for n in handed}) == 4, str(handed))
+
+        print("\nA null project memory")
+        nulls = tmp / "nulls"
+        with zipfile.ZipFile(tmp / "p.zip", "w") as zf:
+            zf.writestr(f"projects/{PROJECT}.json", json.dumps(project_record()))
+            zf.writestr("conversations.json", json.dumps([CONVERSATION]))
+            zf.writestr("memories.json", json.dumps({"project_memories": {PROJECT: None, "other": {}, "blank": "  "}}))
+        run(tmp / "p.zip", nulls, mapping)
+        check("is not written as a note reading \"null\"",
+              not (nulls / "proj" / "project_knowledge" / "_project_memory.md").exists())
+        check("nor as a project memory under account/",
+              not (nulls / "unfiled" / "account" / "memory" / "project_memories").exists())
 
         print("\nThe older memories.json layout")
         legacy = tmp / "legacy"

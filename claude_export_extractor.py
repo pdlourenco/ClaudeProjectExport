@@ -130,6 +130,10 @@ class NameAllocator:
     in place rather than accumulating a copy of every document per run. Names the caller
     reserves up front — the metadata and prompt files — are treated as already taken.
 
+    Names are compared without regard to case. Windows and macOS treat Notes.md and notes.md
+    as one file, so two names differing only by case, handed out as distinct, would have the
+    second silently overwrite the first while the run reported both as written.
+
     Each name resumes from its own counter, so a directory full of identically-named files
     costs one step apiece instead of rescanning from _1 every time.
     """
@@ -137,7 +141,7 @@ class NameAllocator:
     def __init__(self, directory: Path, reserved=()):
         self.directory = directory
         self.counters = {}
-        self.allocated = set(reserved)
+        self.allocated = {name.casefold() for name in reserved}
 
     def allocate(self, filename: str) -> Path:
         stem, dot, ext = filename.rpartition(".")
@@ -150,9 +154,9 @@ class NameAllocator:
         while True:
             candidate = filename if counter == 0 else f"{stem}_{counter}{ext}"
             counter += 1
-            if candidate not in self.allocated:
+            if candidate.casefold() not in self.allocated:
                 self.counters[filename] = counter
-                self.allocated.add(candidate)
+                self.allocated.add(candidate.casefold())
                 return self.directory / candidate
 
 
@@ -2082,6 +2086,9 @@ def _account_records(blob):
 
 
 def _project_memory_text(value) -> str:
+    # A null or empty value is no note. Serialised, a null would become a note reading "null".
+    if value in (None, [], {}):
+        return ""
     return (value if isinstance(value, str) else json.dumps(value, indent=2, ensure_ascii=False)).strip()
 
 
