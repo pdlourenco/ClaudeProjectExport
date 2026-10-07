@@ -373,6 +373,17 @@ def main():
         check("spare images are listed too", "**Also returned**" in transcript and "https://img.example/2.png" in transcript)
         check("a block type with no renderer is shown, not dropped",
               "**Block — future_block**" in transcript and '"anything": 1' in transcript)
+        lone = {**CONVERSATION, "uuid": "c0000000-0000-4000-8000-000000000002", "name": "Lone block",
+                "chat_messages": [message("m9", "assistant", "Cited.", {
+                    "type": "text", "text": "Cited.",
+                    "citations": [{"url": "https://cite.example/a", "title": "A cited page"}]})]}
+        with zipfile.ZipFile(tmp / "o.zip", "w") as zf:
+            zf.writestr(f"projects/{PROJECT}.json", json.dumps(project_record()))
+            zf.writestr("conversations.json", json.dumps([lone]))
+        run(tmp / "o.zip", tmp / "lone", mapping, "--faithful")
+        check("a message whose content is one block still shows its sources",
+              "[A cited page](https://cite.example/a)" in read(tmp / "lone" / "unfiled" / "Lone block.md"))
+
         quiet = read(plain / "unfiled" / "Invented chat.md")
         check("a plain transcript carries none of it",
               not any(s in quiet for s in ("Injected prompt", "Document —", "Block —", "Tool result")))

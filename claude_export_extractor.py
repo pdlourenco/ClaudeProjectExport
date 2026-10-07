@@ -1098,11 +1098,7 @@ def _render_tool_calls(msg) -> list:
     result. None of that reaches the transcript, so a conversation driven by tool calls
     reads as though it happened by magic.
     """
-    raw = msg.get("content")
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return []
+    raw = _content_blocks(msg.get("content"))
 
     lines = []
     for block in raw:
@@ -1176,6 +1172,28 @@ def _fence(text: str, language: str = "") -> list:
     return [f"{mark}{language}", *text.splitlines(), mark]
 
 
+def _quote_fenced(text: str, language: str = "", limit: int = MAX_QUOTED_CHARS) -> list:
+    """Blockquote `text` inside a fence, noting how much was cut if it is over `limit`.
+
+    Cut before fencing, so the closing fence is never what gets cut off.
+    """
+    fenced = "\n".join(_fence(text[:limit], language))
+    rows = _quote(fenced, limit=len(fenced))
+    if len(text) > limit:
+        rows.append(f"> … truncated, {len(text) - limit} more characters")
+    return rows
+
+
+def _content_blocks(content) -> list:
+    """A message's (or a tool result's) content blocks: a lone block is wrapped, and
+    anything that is not a block is left out."""
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
 def _link_text(text) -> str:
     """Escape what would end a markdown link's text early."""
     return str(text).replace("[", "\\[").replace("]", "\\]")
@@ -1221,24 +1239,15 @@ def _render_documents(block) -> list:
             body = doc.get("content") if isinstance(doc.get("content"), str) else ""
         body = body.strip()
         if body:
-            # Cut before fencing, so the closing fence is never what gets cut off.
-            fenced = "\n".join(_fence(body[:MAX_QUOTED_CHARS], "markdown"))
-            lines.extend(_quote(fenced, limit=len(fenced)))
-            if len(body) > MAX_QUOTED_CHARS:
-                lines.append(f"> … truncated, {len(body) - MAX_QUOTED_CHARS} more characters")
+            lines.extend(_quote_fenced(body, "markdown"))
     return lines
 
 
 def _render_images(block) -> list:
     """Render the pictures an image search returned, which no text field mentions."""
-    inner = block.get("content")
-    if isinstance(inner, dict):
-        inner = [inner]
-    if not isinstance(inner, list):
-        return []
     lines = []
-    for item in inner:
-        if not isinstance(item, dict) or item.get("type") != "image_gallery":
+    for item in _content_blocks(block.get("content")):
+        if item.get("type") != "image_gallery":
             continue
         for label, key in (("Images", "images"), ("Also returned", "spare_images")):
             pictures = [p for p in (item.get(key) or []) if isinstance(p, dict)]
@@ -1261,11 +1270,7 @@ def _render_injected_prompts(msg) -> list:
     and — the large one — the memory the model was given. Labelled by what injected them,
     since that is what tells a reader which kind of text they are looking at.
     """
-    raw = msg.get("content")
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return []
+    raw = _content_blocks(msg.get("content"))
     lines = []
     for block in raw:
         if not isinstance(block, dict) or block.get("type") != "injected_prompt_block":
@@ -1286,32 +1291,20 @@ HANDLED_BLOCK_TYPES = {"text", "thinking", "tool_use", "tool_result", "injected_
 
 def _render_unknown_blocks(msg) -> list:
     """Show content blocks of a type this tool has no renderer for, as JSON."""
-    raw = msg.get("content")
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return []
+    raw = _content_blocks(msg.get("content"))
     lines = []
     for block in raw:
         if not isinstance(block, dict) or block.get("type") in HANDLED_BLOCK_TYPES:
             continue
         lines.append(f"> **Block — {block.get('type') or '(untyped)'}**")
-        dumped = json.dumps(block, indent=2, ensure_ascii=False)
-        lines.append("> ```json")
-        for row in dumped[:2000].splitlines():
-            lines.append(f"> {row}")
-        if len(dumped) > 2000:
-            lines.append(f"> … truncated, {len(dumped) - 2000} more characters")
-        lines.append("> ```")
+        lines.extend(_quote_fenced(json.dumps(block, indent=2, ensure_ascii=False), "json", 2000))
         lines.append("")
     return lines
 
 
 def _render_citations(msg) -> list:
     """Render the sources attached to text blocks, which the transcript drops entirely."""
-    raw = msg.get("content")
-    if not isinstance(raw, list):
-        return []
+    raw = _content_blocks(msg.get("content"))
     seen, lines = set(), []
     for block in raw:
         if not isinstance(block, dict):
@@ -1351,11 +1344,7 @@ def _extract_thinking(msg) -> str:
     hidden with its text withheld; neither is worth a section of its own, so both are
     dropped here rather than producing an empty heading.
     """
-    raw = msg.get("content")
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return ""
+    raw = _content_blocks(msg.get("content"))
 
     parts = []
     for block in raw:
