@@ -26,6 +26,7 @@ used as context for Claude Code work.
   project_knowledge/          # Knowledge docs, attachments, prompt template
     _project_metadata.json    # Name, UUID, dates, counts, and how conversations were matched
     _prompt_template.md       # Project custom instructions (if any)
+    _project_memory.md        # Claude's memory note for this project (if any)
     <knowledge files>...      # All uploaded docs
   conversations/              # Related conversation history as markdown
     <conversation>.md ...     # One file per conversation
@@ -34,6 +35,12 @@ used as context for Claude Code work.
   thinking/                   # Only with --thinking or --faithful; same filenames as above
   raw/                        # Only with --faithful; the source records, verbatim
 ```
+
+Account-wide documents — monthly reflections, the conversations summary, every project's memory
+note and the memory files — are written once, under `account/` in the `--unfiled` directory,
+whether or not `--faithful` is set. Without `--unfiled` they are written beside the first project
+only with `--faithful`, since they cover every project; each project folder still gets its own
+`_project_memory.md`.
 
 ## The one thing to get right
 

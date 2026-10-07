@@ -42,6 +42,10 @@ from collections import defaultdict
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+WINDOWS_RESERVED_NAMES = ({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                          | {f"{dev}{n}" for dev in ("COM", "LPT") for n in "0123456789\u00b9\u00b2\u00b3"})
+
+
 def safe_name(name: str, max_len: int = 80) -> str:
     """Sanitize a string for use as a filename."""
     # The surrogate range is here for the same reason as the control characters: JSON
@@ -49,7 +53,15 @@ def safe_name(name: str, max_len: int = 80) -> str:
     name = re.sub(r'[\\/*?:"<>|\x00-\x1f\ud800-\udfff]', "_", name)
     name = re.sub(r"_+", "_", name)
     name = re.sub(r"\s+", " ", name).strip().strip("_. ")
-    return name[:max_len] or "untitled"
+    name = name[:max_len] or "untitled"
+    # Windows reserves these names whatever the extension, and the extended-length paths
+    # the output is written through skip that check: "con.md" becomes a real file that
+    # Explorer and most tools can neither open nor delete. Done everywhere, since output
+    # written elsewhere is often copied to Windows later.
+    base = name.split(".")[0]
+    if base.strip().upper() in WINDOWS_RESERVED_NAMES:
+        name = (base + "_" + name[len(base):])[:max_len]
+    return name
 
 
 def ts(iso: str) -> str:
@@ -118,6 +130,10 @@ class NameAllocator:
     in place rather than accumulating a copy of every document per run. Names the caller
     reserves up front — the metadata and prompt files — are treated as already taken.
 
+    Names are compared without regard to case. Windows and macOS treat Notes.md and notes.md
+    as one file, so two names differing only by case, handed out as distinct, would have the
+    second silently overwrite the first while the run reported both as written.
+
     Each name resumes from its own counter, so a directory full of identically-named files
     costs one step apiece instead of rescanning from _1 every time.
     """
@@ -125,7 +141,7 @@ class NameAllocator:
     def __init__(self, directory: Path, reserved=()):
         self.directory = directory
         self.counters = {}
-        self.allocated = set(reserved)
+        self.allocated = {name.casefold() for name in reserved}
 
     def allocate(self, filename: str) -> Path:
         stem, dot, ext = filename.rpartition(".")
@@ -138,10 +154,31 @@ class NameAllocator:
         while True:
             candidate = filename if counter == 0 else f"{stem}_{counter}{ext}"
             counter += 1
-            if candidate not in self.allocated:
+            if candidate.casefold() not in self.allocated:
                 self.counters[filename] = counter
-                self.allocated.add(candidate)
+                self.allocated.add(candidate.casefold())
                 return self.directory / candidate
+
+
+def _extended(path) -> Path:
+    """On Windows, a form of `path` that is not held to the 260-character limit.
+
+    A file written under files/<conversation>/<name> sits under a title of up to 80
+    characters and a name of up to 80 more, so a modestly deep output directory is enough
+    to pass the limit — and one such file used to end the whole extraction with "Cannot
+    write to". The \\\\?\\ prefix lifts the limit, and pathlib carries it through every
+    join, so applying it to the output directory covers everything written beneath it.
+    Elsewhere the path is returned as it came.
+    """
+    path = Path(path)
+    if sys.platform != "win32":
+        return path
+    text = str(path.resolve())
+    if text.startswith("\\\\?\\"):
+        return Path(text)
+    if text.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + text[2:])
+    return Path("\\\\?\\" + text)
 
 
 # ── Data loading ──────────────────────────────────────────────────────────────
@@ -518,6 +555,7 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False,
     only meaningful when a mapping was supplied; without one every project is matched the
     same way and the field would say nothing.
     """
+    output_dir = _extended(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     docs_dir = output_dir / "project_knowledge"
@@ -549,12 +587,22 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False,
             entry["prompt_template"], encoding="utf-8", errors="backslashreplace"
         )
 
+    # ── Save the project's own memory note ───────────────────────────────
+    # Only this project's: the account's memory also holds every other project's notes and
+    # a summary of all conversations, which do not belong in a folder used as its context.
+    if entry.get("memory"):
+        (docs_dir / "_project_memory.md").write_text(
+            f"# Project memory — {entry['name']}\n\n{entry['memory']}\n",
+            encoding="utf-8", errors="backslashreplace")
+        stats["memory"] = 1
+
     # ── Extract knowledge docs ───────────────────────────────────────────
-    # The metadata and prompt files were written above, and the allocator overwrites files
-    # it did not hand out. safe_name strips leading underscores, so nothing can currently
-    # sanitize onto those names — reserving them keeps that from silently ceasing to be
-    # true if safe_name changes.
-    docs = NameAllocator(docs_dir, reserved=("_project_metadata.json", "_prompt_template.md"))
+    # The metadata, prompt and memory files were written above, and the allocator
+    # overwrites files it did not hand out. safe_name strips leading underscores, so nothing
+    # can currently sanitize onto those names — reserving them keeps that from silently
+    # ceasing to be true if safe_name changes.
+    docs = NameAllocator(docs_dir, reserved=("_project_metadata.json", "_prompt_template.md",
+                                             "_project_memory.md"))
     for doc in entry["docs"]:
         filename = doc.get("filename", "untitled")
         content = doc.get("content", "")
@@ -721,7 +769,8 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
             lines.append("")
 
         if faithful:
-            extra = _render_tool_calls(msg) + _render_citations(msg)
+            extra = (_render_tool_calls(msg) + _render_citations(msg)
+                     + _render_injected_prompts(msg) + _render_unknown_blocks(msg))
             for f in (msg.get("files") or []):
                 if isinstance(f, dict) and f.get("file_name"):
                     extra.append(f"> [File: {f['file_name']}]")
@@ -1039,6 +1088,7 @@ def strategy_counts(index):
 def extract_unfiled(conversations, output_dir: Path, include_thinking: bool = False,
                     faithful: bool = False):
     """Write every unfiled conversation into a single bucket directory."""
+    output_dir = _extended(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     stats = {"conversations": 0, "convs_msgs": 0, "files": 0}
@@ -1062,11 +1112,7 @@ def _render_tool_calls(msg) -> list:
     result. None of that reaches the transcript, so a conversation driven by tool calls
     reads as though it happened by magic.
     """
-    raw = msg.get("content")
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return []
+    raw = _content_blocks(msg.get("content"))
 
     lines = []
     for block in raw:
@@ -1113,15 +1159,166 @@ def _render_tool_calls(msg) -> list:
                     lines.append(f"> {text[:2000]}")
                     if len(text) > 2000:
                         lines.append(f"> … truncated, {len(text) - 2000} more characters")
+            lines.extend(_render_documents(block))
+            lines.extend(_render_images(block))
             lines.append("")
+    return lines
+
+
+# A document's body is the point of rendering it, so the cap is generous; it exists only so
+# one pathological record cannot turn a transcript into a data dump. Cut text is counted.
+MAX_QUOTED_CHARS = 20000
+
+
+def _quote(text: str, limit: int = MAX_QUOTED_CHARS) -> list:
+    """Blockquote `text` line by line, noting how much was cut if it is over `limit`."""
+    cut = len(text) - limit
+    rows = [f"> {row}".rstrip() for row in text[:limit].splitlines()]
+    if cut > 0:
+        rows.append(f"> … truncated, {cut} more characters")
+    return rows
+
+
+def _fence(text: str, language: str = "") -> list:
+    """Fence `text` so that backticks inside it cannot close the fence early."""
+    longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    mark = "`" * max(3, longest + 1)
+    return [f"{mark}{language}", *text.splitlines(), mark]
+
+
+def _quote_fenced(text: str, language: str = "", limit: int = MAX_QUOTED_CHARS) -> list:
+    """Blockquote `text` inside a fence, noting how much was cut if it is over `limit`.
+
+    Cut before fencing, so the closing fence is never what gets cut off.
+    """
+    fenced = "\n".join(_fence(text[:limit], language))
+    rows = _quote(fenced, limit=len(fenced))
+    if len(text) > limit:
+        rows.append(f"> … truncated, {len(text) - limit} more characters")
+    return rows
+
+
+def _content_blocks(content) -> list:
+    """A message's (or a tool result's) content blocks: a lone block is wrapped, and
+    anything that is not a block is left out."""
+    if isinstance(content, dict):
+        content = [content]
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
+def _link_text(text) -> str:
+    """Escape what would end a markdown link's text early."""
+    return str(text).replace("[", "\\[").replace("]", "\\]")
+
+
+def _structured_documents(structured) -> list:
+    """The documents a result's structured_content carries, however it nests them.
+
+    A memory read returns a `documents` list; a single-document result carries the
+    document's fields directly. Anything else holds none.
+    """
+    if not isinstance(structured, dict):
+        return []
+    docs = structured.get("documents")
+    if isinstance(docs, list):
+        return [d for d in docs if isinstance(d, dict)]
+    if structured.get("path") or isinstance(structured.get("parsed"), dict):
+        return [structured]
+    return []
+
+
+def _render_documents(block) -> list:
+    """Render the documents a tool result returned, which the result's message only counts.
+
+    A memory read says "Recalled 3 memories" and holds the three documents in
+    structured_content — path, version and the full body. The message is all that used to
+    reach the transcript, so what Claude was actually shown was recoverable only from raw/.
+    """
+    lines = []
+    for doc in _structured_documents(block.get("structured_content")):
+        parsed = doc.get("parsed") if isinstance(doc.get("parsed"), dict) else {}
+        path = doc.get("path") or parsed.get("name") or "(unnamed document)"
+        kind = doc.get("memory_op_kind")
+        meta = [f"version {doc['version']}" if doc.get("version") else "",
+                f"updated {ts(doc['updated_at'])}" if doc.get("updated_at") else "",
+                str(kind) if kind else ""]
+        meta = ", ".join(m for m in meta if m)
+        lines.append(f"> **Document — {path}**" + (f" _({meta})_" if meta else ""))
+        if parsed.get("description"):
+            lines.append(f"> _{str(parsed['description']).strip()}_")
+        body = parsed.get("body")
+        if not isinstance(body, str):
+            body = doc.get("content") if isinstance(doc.get("content"), str) else ""
+        body = body.strip()
+        if body:
+            lines.extend(_quote_fenced(body, "markdown"))
+    return lines
+
+
+def _render_images(block) -> list:
+    """Render the pictures an image search returned, which no text field mentions."""
+    lines = []
+    for item in _content_blocks(block.get("content")):
+        if item.get("type") != "image_gallery":
+            continue
+        for label, key in (("Images", "images"), ("Also returned", "spare_images")):
+            pictures = [p for p in (item.get(key) or []) if isinstance(p, dict)]
+            if not pictures:
+                continue
+            lines.append(f"> **{label}**")
+            for pic in pictures:
+                title = pic.get("title") or pic.get("url") or "image"
+                link = pic.get("page_url") or pic.get("url")
+                entry = f"[{_link_text(title)}]({link})" if link else _link_text(title)
+                source = f" — {pic['source']}" if pic.get("source") else ""
+                lines.append(f"> - {entry}{source}")
+    return lines
+
+
+def _render_injected_prompts(msg) -> list:
+    """Render the text the platform added to a message before the model saw it.
+
+    These blocks are not something the user typed or the model said: the date, a suffix,
+    and — the large one — the memory the model was given. Labelled by what injected them,
+    since that is what tells a reader which kind of text they are looking at.
+    """
+    raw = _content_blocks(msg.get("content"))
+    lines = []
+    for block in raw:
+        if not isinstance(block, dict) or block.get("type") != "injected_prompt_block":
+            continue
+        prompt = block.get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            continue
+        lines.append(f"> **Injected prompt — {block.get('injection_source') or 'unknown source'}**")
+        lines.extend(_quote(prompt.strip()))
+        lines.append("")
+    return lines
+
+
+# Block types the transcript already accounts for, one way or another. Anything else is
+# shown generically rather than dropped: the export has added block types before.
+HANDLED_BLOCK_TYPES = {"text", "thinking", "tool_use", "tool_result", "injected_prompt_block"}
+
+
+def _render_unknown_blocks(msg) -> list:
+    """Show content blocks of a type this tool has no renderer for, as JSON."""
+    raw = _content_blocks(msg.get("content"))
+    lines = []
+    for block in raw:
+        if not isinstance(block, dict) or block.get("type") in HANDLED_BLOCK_TYPES:
+            continue
+        lines.append(f"> **Block — {block.get('type') or '(untyped)'}**")
+        lines.extend(_quote_fenced(json.dumps(block, indent=2, ensure_ascii=False), "json", 2000))
+        lines.append("")
     return lines
 
 
 def _render_citations(msg) -> list:
     """Render the sources attached to text blocks, which the transcript drops entirely."""
-    raw = msg.get("content")
-    if not isinstance(raw, list):
-        return []
+    raw = _content_blocks(msg.get("content"))
     seen, lines = set(), []
     for block in raw:
         if not isinstance(block, dict):
@@ -1161,11 +1358,7 @@ def _extract_thinking(msg) -> str:
     hidden with its text withheld; neither is worth a section of its own, so both are
     dropped here rather than producing an empty heading.
     """
-    raw = msg.get("content")
-    if isinstance(raw, dict):
-        raw = [raw]
-    if not isinstance(raw, list):
-        return ""
+    raw = _content_blocks(msg.get("content"))
 
     parts = []
     for block in raw:
@@ -1316,6 +1509,16 @@ def extract_or_exit(entry, out_dir: Path, record_strategy: bool = False,
         sys.exit(1)
 
 
+def print_stats(stats):
+    """Report what one project's extraction wrote."""
+    print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
+    print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
+    if stats.get("files"):
+        print(f"  {stats['files']} files Claude produced")
+    if stats.get("memory"):
+        print("  project memory note")
+
+
 def interactive_mode(index, show_strategy: bool = False, include_thinking: bool = False,
                      faithful: bool = False):
     """Run interactive project selection and extraction."""
@@ -1377,10 +1580,7 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
     for entry, out_dir in extractions:
         print(f"\nExtracting: {entry['name']} -> {out_dir}")
         stats = extract_or_exit(entry, out_dir, show_strategy, include_thinking, faithful)
-        print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
-        print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
-        if stats.get("files"):
-            print(f"  {stats['files']} files Claude produced")
+        print_stats(stats)
 
     # The first directory, so a caller wanting somewhere to put run-level files has one.
     # Falsy when nothing was extracted, which is what the caller reads as "no output to
@@ -1480,6 +1680,7 @@ def main():
                   f"the fetch will look unmapped — re-run fetch_mapping.js for a current mapping.",
                   file=sys.stderr)
 
+    project_names = {p["uuid"]: p.get("name") or p["uuid"] for p in projects if p.get("uuid")}
     index = build_project_index(projects, conversations, mapping=mapping,
                                 allow_fuzzy=(mapping is None or args.fuzzy))
     print(f"Found {len(index)} projects, {len(conversations)} conversations",
@@ -1497,6 +1698,13 @@ def main():
     if args.json:
         print_json_index(index, show_strategy=mapping is not None)
         return
+
+    # Each project carries its own memory note into its folder. The account files are read
+    # here, once, for that and for the account-level output written later.
+    account = load_account_files(zip_path)
+    memories = project_memories_by_uuid(account)
+    for entry in index:
+        entry["memory"] = memories.get(entry["uuid"], "")
 
     # Non-interactive mode — extract specified projects
     # `is not None`, so that --extract "" is an error rather than a silent fall-through
@@ -1543,19 +1751,17 @@ def main():
             plan.append((entry, out_dir))
         assert_distinct_dirs(plan)
 
-        if args.faithful:
-            # The unfiled bucket when there is one, otherwise the first project's directory,
-            # resolved default included. Account files are not project data, so one copy.
-            copy_account_files(zip_path, Path(args.unfiled) if args.unfiled else plan[0][1])
+        # The unfiled bucket when there is one, otherwise the first project's directory,
+        # resolved default included. Account files are not project data, so one copy.
+        account_home = Path(args.unfiled) if args.unfiled else plan[0][1]
+        write_account_output(account, account_home, project_names, args.faithful,
+                             in_project=not args.unfiled)
 
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
             stats = extract_or_exit(entry, out_dir, mapping is not None,
                                     args.thinking or args.faithful, args.faithful)
-            print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
-            print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
-            if stats.get("files"):
-                print(f"  {stats['files']} files Claude produced")
+            print_stats(stats)
 
         _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
@@ -1566,13 +1772,43 @@ def main():
                               include_thinking=args.thinking or args.faithful,
                               faithful=args.faithful)
     if chosen:
-        if args.faithful:
-            copy_account_files(zip_path, Path(args.unfiled) if args.unfiled else chosen)
+        account_home = Path(args.unfiled) if args.unfiled else chosen
+        write_account_output(account, account_home, project_names, args.faithful,
+                             in_project=not args.unfiled)
         _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
 
 
-def copy_account_files(zip_path: Path, destination: Path):
+def write_account_output(account: dict, destination: Path, project_names, faithful: bool,
+                         in_project: bool = False):
+    """Write everything account-level into destination: the rendered documents, and under
+    --faithful the raw files too.
+
+    When destination is a project's own folder, nothing is written unless --faithful asks
+    for everything. The account's memory covers every project, and a project folder is
+    often handed to Claude Code as context; filling it with every other project's notes
+    is not something a plain --extract should do unasked. Each project still gets its own
+    note, written by extract_project.
+    """
+    if in_project and not faithful:
+        if any(Path(name).name not in RAW_ONLY_ACCOUNT_FILES for name in account):
+            print("\nNOTE: account-wide memory and reflections were not written; each project's "
+                  "own memory note is in its project_knowledge/_project_memory.md. Pass "
+                  "--unfiled DIR to write the rest there, or --faithful to write it beside the "
+                  "first project.", file=sys.stderr)
+        return
+    try:
+        if faithful:
+            copy_account_files(account, destination)
+        write_account_documents(account, destination, project_names, faithful)
+    except OSError as exc:
+        # Account files are not project data, so failing to write them is reported and the
+        # projects are still extracted, rather than ending the run before any project is.
+        print(f"WARNING: Could not write the account files to {destination}: {exc}",
+              file=sys.stderr)
+
+
+def copy_account_files(account: dict, destination: Path):
     """Carry across the archive's account-level files, once.
 
     Called only after an extraction plan resolves, so the destination is a directory that
@@ -1580,10 +1816,10 @@ def copy_account_files(zip_path: Path, destination: Path):
     Doing it earlier meant a --json listing wrote files to disk, and a run using default
     directories carried nothing at all, which are the two commonest ways to invoke this.
     """
-    account = load_account_files(zip_path)
     if not account:
         return
-    target = Path(destination) / "raw" / "account"
+    shown = Path(destination) / "raw" / "account"
+    target = _extended(destination) / "raw" / "account"
     target.mkdir(parents=True, exist_ok=True)
     for name, blob in account.items():
         # Segments are sanitized on the way out as well as on the way in: the key came
@@ -1594,8 +1830,342 @@ def copy_account_files(zip_path: Path, destination: Path):
             continue
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(blob)
-    print(f"\nAccount files -> {target}")
+    print(f"\nAccount files -> {shown}")
     print(f"  {', '.join(sorted(account))}")
+
+
+# ── Account-level documents ───────────────────────────────────────────────────
+
+# Account files with nothing worth reading: identity and sign-in records. They are carried
+# verbatim under --faithful and are deliberately not rendered.
+RAW_ONLY_ACCOUNT_FILES = {"users.json", "login_history.json"}
+
+# What a reflection's content holds, in the order it reads best. Anything else it carries
+# is rendered after these rather than dropped.
+REFLECTION_HEADINGS = {
+    "stats": "Stats",
+    "topics": "Topics",
+    "about_your_time": "About your time",
+    "expanding_your_skills": "Expanding your skills",
+    "worth_thinking_about": "Worth thinking about",
+}
+REFLECTION_SCALARS = ("hero_title", "hero_body", "period")
+
+
+def _as_text(value) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _render_section_items(items) -> list:
+    """Render a list of {title, body, ...} records, falling back to JSON for anything else."""
+    lines = []
+    for item in items:
+        if not isinstance(item, dict):
+            lines.extend([*_fence(json.dumps(item, indent=2, ensure_ascii=False), "json"), ""])
+            continue
+        title = _as_text(item.get("title")) or _as_text(item.get("label")) or "(untitled)"
+        extras = [f"{k}: {v}" for k, v in item.items()
+                  if k not in ("title", "body", "label") and isinstance(v, (str, int, float))]
+        lines.append(f"### {title}" + (f" _({'; '.join(extras)})_" if extras else ""))
+        if _as_text(item.get("body")):
+            lines.extend(["", _as_text(item["body"])])
+        lines.append("")
+    return lines
+
+
+def _render_value(value) -> list:
+    """Render a section's value whatever its shape: prose as prose, a list as records, and
+    anything else as JSON — so a section in an unexpected shape is shown, not skipped."""
+    if isinstance(value, str):
+        return [value.strip(), ""]
+    if isinstance(value, list):
+        return _render_section_items(value)
+    return [*_fence(json.dumps(value, indent=2, ensure_ascii=False), "json"), ""]
+
+
+def render_reflection(entry) -> str:
+    """One month's reflection as markdown. Tolerates any section being absent."""
+    content = entry.get("content") if isinstance(entry.get("content"), dict) else {}
+    period = _as_text(entry.get("period")) or _as_text(content.get("period"))
+    lines = [f"# {_as_text(content.get('hero_title')) or 'Reflection ' + period}\n"]
+    meta = [f"- **Period:** {period}" if period else "",
+            f"- **Created:** {ts(entry['created_at'])}" if entry.get("created_at") else "",
+            f"- **Updated:** {ts(entry['updated_at'])}" if entry.get("updated_at") else ""]
+    lines.extend(m for m in meta if m)
+    if _as_text(content.get("hero_body")):
+        lines.extend(["", _as_text(content["hero_body"])])
+    lines.append("")
+
+    # A known section in a shape other than the one expected — a dict of stats, prose
+    # where a list was, plain strings for topics — is rendered generically, not dropped.
+    stats = content.get("stats")
+    if stats not in (None, "", [], {}):
+        lines.extend(["## Stats", ""])
+        if isinstance(stats, list):
+            for s in stats:
+                if isinstance(s, dict):
+                    tail = f" — {s['sublabel']}" if s.get("sublabel") else ""
+                    lines.append(f"- **{s.get('n', '')}** {s.get('label', '')}{tail}".rstrip())
+                else:
+                    lines.append(f"- {s}")
+            lines.append("")
+        else:
+            lines.extend(_render_value(stats))
+
+    topics = content.get("topics")
+    if topics not in (None, "", [], {}):
+        lines.extend(["## Topics", ""])
+        if isinstance(topics, list):
+            for t in topics:
+                if isinstance(t, dict):
+                    pct = f" ({t['percent']}%)" if t.get("percent") is not None else ""
+                    desc = f" — {_as_text(t.get('description'))}" if _as_text(t.get("description")) else ""
+                    lines.append(f"- **{_as_text(t.get('title')) or '(untitled)'}**{pct}{desc}")
+                else:
+                    lines.append(f"- {t}")
+            lines.append("")
+        else:
+            lines.extend(_render_value(topics))
+
+    for key, heading in REFLECTION_HEADINGS.items():
+        if key in ("stats", "topics"):
+            continue
+        value = content.get(key)
+        if value not in (None, "", [], {}):
+            lines.extend([f"## {heading}", ""])
+            lines.extend(_render_value(value))
+
+    known = set(REFLECTION_HEADINGS) | set(REFLECTION_SCALARS)
+    for key, value in content.items():
+        if key in known or value in (None, "", [], {}):
+            continue
+        lines.extend([f"## {key.replace('_', ' ').capitalize()}", ""])
+        lines.extend(_render_value(value))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _table_cell(text: str) -> str:
+    """Escape what would end a markdown table cell or row early."""
+    return " ".join(text.replace("|", "\\|").split())
+
+
+class _AccountDocuments:
+    """Writes the account documents of every account file into one account/ directory.
+
+    An export can carry several memory or reflection files (memories/<uuid>.json is one per
+    account), so the output is shared across them: names are handed out by one allocator per
+    directory, and the summary, the feedback and the index — one file each — are collected
+    and written once at the end. Rendering each file on its own let the last one overwrite
+    the others' feedback.md, conversations_memory.md and _index.md, while the totals still
+    counted every one.
+    """
+
+    def __init__(self, root: Path, project_names: dict):
+        self.root = root
+        self.project_names = project_names
+        self.counts = {"reflections": 0, "feedback": 0, "summary": 0,
+                       "project_memories": 0, "memory_files": 0}
+        self.allocators = {}
+        self.feedback, self.summaries, self.index, self.memory_files = [], [], [], []
+        self.unnamed = 0
+
+    def allocate(self, folder: Path, filename: str, reserved=()) -> Path:
+        if folder not in self.allocators:
+            folder.mkdir(parents=True, exist_ok=True)
+            self.allocators[folder] = NameAllocator(folder, reserved)
+        return self.allocators[folder].allocate(filename)
+
+    def add_reflections(self, blob):
+        """Each reflection as reflections/<period>.md; the feedback list is kept for finish()."""
+        entries = blob.get("reflections")
+        entries = [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
+        for entry in entries:
+            content = entry.get("content") if isinstance(entry.get("content"), dict) else {}
+            label = (_as_text(entry.get("period")) or _as_text(content.get("period"))
+                     or ts_short(entry.get("created_at", "")) or "reflection")
+            self.allocate(self.root / "reflections", safe_name(label) + ".md").write_text(
+                render_reflection(entry), encoding="utf-8", errors="backslashreplace")
+            self.counts["reflections"] += 1
+
+        feedback = blob.get("feedback")
+        if isinstance(feedback, list):
+            self.feedback.extend(feedback)
+            self.counts["feedback"] += len(feedback)
+
+    def add_memory(self, blob):
+        """The summary, per-project notes, and the memory files of one memory record."""
+        directory = self.root / "memory"
+
+        summary = _as_text(blob.get("conversations_memory"))
+        if summary:
+            self.summaries.append(summary)
+            self.counts["summary"] += 1
+
+        projects = blob.get("project_memories")
+        if isinstance(projects, dict):
+            for uuid, text in projects.items():
+                body = _project_memory_text(text)
+                if not body:
+                    continue
+                label = self.project_names.get(uuid) or str(uuid)
+                self.allocate(directory / "project_memories", safe_name(label) + ".md").write_text(
+                    f"# Memory — {label}\n\n- **Project:** {uuid}\n\n{body}\n",
+                    encoding="utf-8", errors="backslashreplace")
+                self.counts["project_memories"] += 1
+
+        files = blob.get("memory_files")
+        if isinstance(files, list):
+            # Written in finish(), once every folder is known: a memory file's path can be
+            # another's folder ("notes" and "notes/x.md"), and whichever came first would
+            # otherwise leave the other a file where it needs a folder, or the reverse.
+            self.memory_files.extend(r for r in files
+                                     if isinstance(r, dict) and isinstance(r.get("content"), str))
+
+    def _write_memory_files(self):
+        documents = self.root / "memory" / "documents"
+        placed = []
+        # A folder keeps the spelling it was first seen with. Areas/ and areas/ are one folder
+        # on Windows and macOS, and as two they would each hand out note.md, the second
+        # overwriting the first there.
+        spelled = {}
+        for record in self.memory_files:
+            # The path came from the export, so it is sanitized segment by segment on its
+            # way to disk, and "." and ".." are already gone from _path_segments.
+            segments = _path_segments(record.get("path") or "")
+            if segments:
+                folders = [safe_name(p) for p in segments[:-1]]
+                folders = tuple(spelled.setdefault(tuple(f.casefold() for f in folders[:depth + 1]),
+                                                   folders[depth])
+                                for depth in range(len(folders)))
+                filename = safe_filename(segments[-1])
+            else:
+                self.unnamed += 1
+                folders, filename = (), f"memory_{self.unnamed}.md"
+            placed.append((record, folders, filename))
+        # Every folder some file needs, so that no file is handed a folder's name.
+        subfolders = defaultdict(set)
+        for _, folders, _ in placed:
+            for depth in range(len(folders)):
+                subfolders[folders[:depth]].add(folders[depth])
+        for record, folders, filename in placed:
+            out_path = self.allocate(documents.joinpath(*folders), filename,
+                                     reserved=subfolders[folders])
+            out_path.write_text(record["content"], encoding="utf-8", errors="backslashreplace")
+            # Strings, whatever the export held, so the index sorts and renders as text.
+            self.index.append((str(record.get("path") or "(no path)"),
+                               str(ts(record.get("updated_at") or "")), len(record["content"])))
+            self.counts["memory_files"] += 1
+
+    def finish(self):
+        """Write the files that collect something from every account file."""
+        self._write_memory_files()
+        if self.feedback:
+            # Nothing is known of this list's shape beyond it being a list, so it is shown as
+            # what it is rather than rendered as something it might not be.
+            self.root.mkdir(parents=True, exist_ok=True)
+            text = ("# Feedback\n\n"
+                    + "\n".join(_fence(json.dumps(self.feedback, indent=2, ensure_ascii=False), "json"))
+                    + "\n")
+            (self.root / "feedback.md").write_text(text, encoding="utf-8", errors="backslashreplace")
+        directory = self.root / "memory"
+        if self.summaries:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "conversations_memory.md").write_text(
+                "# Conversations memory\n\n" + "\n\n---\n\n".join(self.summaries) + "\n",
+                encoding="utf-8", errors="backslashreplace")
+        if self.index:
+            rows = ["# Memory documents\n", "| Path | Updated | Characters |", "|---|---|---|"]
+            rows += [f"| {_table_cell(p)} | {_table_cell(u)} | {c} |" for p, u, c in sorted(self.index)]
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "_index.md").write_text("\n".join(rows) + "\n", encoding="utf-8",
+                                                 errors="backslashreplace")
+
+
+def _account_records(blob):
+    """An account file's records, or None if it is not JSON.
+
+    The older memories.json is a list of memory records rather than one record.
+    """
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    return data if isinstance(data, list) else [data]
+
+
+def _project_memory_text(value) -> str:
+    # A null or empty value is no note. Serialised, a null would become a note reading "null".
+    if value in (None, [], {}):
+        return ""
+    return (value if isinstance(value, str) else json.dumps(value, indent=2, ensure_ascii=False)).strip()
+
+
+def project_memories_by_uuid(account: dict) -> dict:
+    """Each project's memory note, project uuid -> text, gathered from every account file."""
+    notes = defaultdict(list)
+    for name, blob in account.items():
+        if Path(name).name in RAW_ONLY_ACCOUNT_FILES:
+            continue
+        for record in _account_records(blob) or []:
+            projects = record.get("project_memories") if isinstance(record, dict) else None
+            if isinstance(projects, dict):
+                for uuid, value in projects.items():
+                    text = _project_memory_text(value)
+                    if text:
+                        notes[str(uuid)].append(text)
+    return {uuid: "\n\n---\n\n".join(texts) for uuid, texts in notes.items()}
+
+
+def write_account_documents(account: dict, destination: Path, project_names=None,
+                            faithful: bool = False) -> dict:
+    """Render the account-level files that have something to read, once, into destination.
+
+    Reflections and memory are account data, not project data, so like the raw account
+    files they are written once, beside whatever the caller treats as the account's home.
+    They are not behind --faithful: they are the content of the export, not a way of
+    rendering it. Files recognised by what they hold rather than by what they are called,
+    since the export has already renamed a category (it is "feedback" in the manifest and
+    reflections/ in the archive).
+
+    A file with no renderer is named in a note rather than passed over, because without
+    --faithful nothing else keeps it.
+    """
+    shown = Path(destination) / "account"
+    documents = _AccountDocuments(_extended(destination) / "account", project_names or {})
+    unrendered = []
+
+    for name, blob in account.items():
+        if Path(name).name in RAW_ONLY_ACCOUNT_FILES:
+            continue
+        records = _account_records(blob)
+        if records is None:
+            unrendered.append(name)
+            continue
+        # An empty list has nothing in it to lose.
+        recognised = not records
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if "reflections" in record or "feedback" in record:
+                recognised = True
+                documents.add_reflections(record)
+            if any(k in record for k in ("conversations_memory", "project_memories", "memory_files")):
+                recognised = True
+                documents.add_memory(record)
+        if not recognised:
+            unrendered.append(name)
+    documents.finish()
+
+    totals = documents.counts
+    if any(totals.values()):
+        print(f"\nAccount documents -> {shown}")
+        print("  " + ", ".join(f"{n} {k.replace('_', ' ')}" for k, n in totals.items() if n))
+    if unrendered:
+        kept = ("They are kept verbatim under raw/account/." if faithful
+                else "Pass --faithful to keep them verbatim under raw/account/.")
+        print(f"\nNOTE: no readable rendering for account file(s): {', '.join(sorted(unrendered))}. "
+              f"{kept}", file=sys.stderr)
+    return totals
 
 
 def _extract_unfiled(unfiled_dir, unfiled, include_thinking: bool = False,
