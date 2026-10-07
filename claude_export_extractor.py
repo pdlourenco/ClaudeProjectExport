@@ -583,12 +583,22 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False,
             entry["prompt_template"], encoding="utf-8", errors="backslashreplace"
         )
 
+    # ── Save the project's own memory note ───────────────────────────────
+    # Only this project's: the account's memory also holds every other project's notes and
+    # a summary of all conversations, which do not belong in a folder used as its context.
+    if entry.get("memory"):
+        (docs_dir / "_project_memory.md").write_text(
+            f"# Project memory — {entry['name']}\n\n{entry['memory']}\n",
+            encoding="utf-8", errors="backslashreplace")
+        stats["memory"] = 1
+
     # ── Extract knowledge docs ───────────────────────────────────────────
-    # The metadata and prompt files were written above, and the allocator overwrites files
-    # it did not hand out. safe_name strips leading underscores, so nothing can currently
-    # sanitize onto those names — reserving them keeps that from silently ceasing to be
-    # true if safe_name changes.
-    docs = NameAllocator(docs_dir, reserved=("_project_metadata.json", "_prompt_template.md"))
+    # The metadata, prompt and memory files were written above, and the allocator
+    # overwrites files it did not hand out. safe_name strips leading underscores, so nothing
+    # can currently sanitize onto those names — reserving them keeps that from silently
+    # ceasing to be true if safe_name changes.
+    docs = NameAllocator(docs_dir, reserved=("_project_metadata.json", "_prompt_template.md",
+                                             "_project_memory.md"))
     for doc in entry["docs"]:
         filename = doc.get("filename", "untitled")
         content = doc.get("content", "")
@@ -1495,6 +1505,16 @@ def extract_or_exit(entry, out_dir: Path, record_strategy: bool = False,
         sys.exit(1)
 
 
+def print_stats(stats):
+    """Report what one project's extraction wrote."""
+    print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
+    print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
+    if stats.get("files"):
+        print(f"  {stats['files']} files Claude produced")
+    if stats.get("memory"):
+        print("  project memory note")
+
+
 def interactive_mode(index, show_strategy: bool = False, include_thinking: bool = False,
                      faithful: bool = False):
     """Run interactive project selection and extraction."""
@@ -1556,10 +1576,7 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
     for entry, out_dir in extractions:
         print(f"\nExtracting: {entry['name']} -> {out_dir}")
         stats = extract_or_exit(entry, out_dir, show_strategy, include_thinking, faithful)
-        print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
-        print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
-        if stats.get("files"):
-            print(f"  {stats['files']} files Claude produced")
+        print_stats(stats)
 
     # The first directory, so a caller wanting somewhere to put run-level files has one.
     # Falsy when nothing was extracted, which is what the caller reads as "no output to
@@ -1678,6 +1695,13 @@ def main():
         print_json_index(index, show_strategy=mapping is not None)
         return
 
+    # Each project carries its own memory note into its folder. The account files are read
+    # here, once, for that and for the account-level output written later.
+    account = load_account_files(zip_path)
+    memories = project_memories_by_uuid(account)
+    for entry in index:
+        entry["memory"] = memories.get(entry["uuid"], "")
+
     # Non-interactive mode — extract specified projects
     # `is not None`, so that --extract "" is an error rather than a silent fall-through
     # into interactive mode, which then dies on a closed stdin.
@@ -1726,17 +1750,14 @@ def main():
         # The unfiled bucket when there is one, otherwise the first project's directory,
         # resolved default included. Account files are not project data, so one copy.
         account_home = Path(args.unfiled) if args.unfiled else plan[0][1]
-        write_account_output(zip_path, account_home, project_names, args.faithful,
+        write_account_output(account, account_home, project_names, args.faithful,
                              in_project=not args.unfiled)
 
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
             stats = extract_or_exit(entry, out_dir, mapping is not None,
                                     args.thinking or args.faithful, args.faithful)
-            print(f"  {stats['docs']} docs ({stats['docs_kb']:.0f} KB)")
-            print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
-            if stats.get("files"):
-                print(f"  {stats['files']} files Claude produced")
+            print_stats(stats)
 
         _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
@@ -1748,28 +1769,29 @@ def main():
                               faithful=args.faithful)
     if chosen:
         account_home = Path(args.unfiled) if args.unfiled else chosen
-        write_account_output(zip_path, account_home, project_names, args.faithful,
+        write_account_output(account, account_home, project_names, args.faithful,
                              in_project=not args.unfiled)
         _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
 
 
-def write_account_output(zip_path: Path, destination: Path, project_names, faithful: bool,
+def write_account_output(account: dict, destination: Path, project_names, faithful: bool,
                          in_project: bool = False):
     """Write everything account-level into destination: the rendered documents, and under
-    --faithful the raw files too. The archive is read once for both.
+    --faithful the raw files too.
 
     When destination is a project's own folder, nothing is written unless --faithful asks
     for everything. The account's memory covers every project, and a project folder is
     often handed to Claude Code as context; filling it with every other project's notes
-    is not something a plain --extract should do unasked.
+    is not something a plain --extract should do unasked. Each project still gets its own
+    note, written by extract_project.
     """
-    account = load_account_files(zip_path)
     if in_project and not faithful:
         if any(Path(name).name not in RAW_ONLY_ACCOUNT_FILES for name in account):
-            print("\nNOTE: account-level memory and reflections were not written. They cover the "
-                  "whole account, not this project: pass --unfiled DIR to write them there, or "
-                  "--faithful to write them beside the first project.", file=sys.stderr)
+            print("\nNOTE: account-wide memory and reflections were not written; each project's "
+                  "own memory note is in its project_knowledge/_project_memory.md. Pass "
+                  "--unfiled DIR to write the rest there, or --faithful to write it beside the "
+                  "first project.", file=sys.stderr)
         return
     try:
         if faithful:
@@ -1978,12 +2000,12 @@ class _AccountDocuments:
         projects = blob.get("project_memories")
         if isinstance(projects, dict):
             for uuid, text in projects.items():
-                body = text if isinstance(text, str) else json.dumps(text, indent=2, ensure_ascii=False)
-                if not body.strip():
+                body = _project_memory_text(text)
+                if not body:
                     continue
                 label = self.project_names.get(uuid) or str(uuid)
                 self.allocate(directory / "project_memories", safe_name(label) + ".md").write_text(
-                    f"# Memory — {label}\n\n- **Project:** {uuid}\n\n{body.strip()}\n",
+                    f"# Memory — {label}\n\n- **Project:** {uuid}\n\n{body}\n",
                     encoding="utf-8", errors="backslashreplace")
                 self.counts["project_memories"] += 1
 
@@ -2047,6 +2069,38 @@ class _AccountDocuments:
                                                  errors="backslashreplace")
 
 
+def _account_records(blob):
+    """An account file's records, or None if it is not JSON.
+
+    The older memories.json is a list of memory records rather than one record.
+    """
+    try:
+        data = json.loads(blob)
+    except ValueError:
+        return None
+    return data if isinstance(data, list) else [data]
+
+
+def _project_memory_text(value) -> str:
+    return (value if isinstance(value, str) else json.dumps(value, indent=2, ensure_ascii=False)).strip()
+
+
+def project_memories_by_uuid(account: dict) -> dict:
+    """Each project's memory note, project uuid -> text, gathered from every account file."""
+    notes = defaultdict(list)
+    for name, blob in account.items():
+        if Path(name).name in RAW_ONLY_ACCOUNT_FILES:
+            continue
+        for record in _account_records(blob) or []:
+            projects = record.get("project_memories") if isinstance(record, dict) else None
+            if isinstance(projects, dict):
+                for uuid, value in projects.items():
+                    text = _project_memory_text(value)
+                    if text:
+                        notes[str(uuid)].append(text)
+    return {uuid: "\n\n---\n\n".join(texts) for uuid, texts in notes.items()}
+
+
 def write_account_documents(account: dict, destination: Path, project_names=None,
                             faithful: bool = False) -> dict:
     """Render the account-level files that have something to read, once, into destination.
@@ -2068,14 +2122,11 @@ def write_account_documents(account: dict, destination: Path, project_names=None
     for name, blob in account.items():
         if Path(name).name in RAW_ONLY_ACCOUNT_FILES:
             continue
-        try:
-            data = json.loads(blob)
-        except ValueError:
+        records = _account_records(blob)
+        if records is None:
             unrendered.append(name)
             continue
-        # The older memories.json is a list of memory records rather than one record, and
-        # an empty list has nothing in it to lose.
-        records = data if isinstance(data, list) else [data]
+        # An empty list has nothing in it to lose.
         recognised = not records
         for record in records:
             if not isinstance(record, dict):

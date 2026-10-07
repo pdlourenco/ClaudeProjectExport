@@ -138,6 +138,7 @@ Each extracted project creates this organized layout:
 │   ├── _project_metadata.json    # Project name, UUID, dates, doc/conversation counts
 │   │                             #   (plus how conversations were matched, with --mapping)
 │   ├── _prompt_template.md       # Project custom instructions (if the project had one)
+│   ├── _project_memory.md        # Claude's memory note for this project (if it has one)
 │   ├── research-paper.pdf        # Knowledge docs you uploaded to the project
 │   ├── api-spec.yaml             #   (identical copies deduplicated; same name but
 │   │                             #    different content is kept as api-spec_1.yaml)
@@ -172,12 +173,15 @@ _unfiled/
 
 ### Account-level documents
 
-Reflections and memory belong to your account rather than to any project, so they are written
-once, under `account/`. With `--unfiled` they go into that directory by default, not only with
-`--faithful`. Without `--unfiled` they are written beside the first project only with
-`--faithful`: the memory covers every project, and a project folder handed to Claude Code as
-context should not carry every other project's notes unasked. A note on stderr says when they
-were left out.
+Each extracted project gets its own memory note, if Claude keeps one for it, as
+`project_knowledge/_project_memory.md`. That is the only memory a project folder receives by
+default: the rest of the account's memory covers every project, and a folder handed to Claude
+Code as context should not carry other projects' notes or a summary of all your conversations.
+
+The account-wide documents (reflections, the conversations summary, every project's note, and
+the memory files) are written once, under `account/`. With `--unfiled` they go into that
+directory, with or without `--faithful`. Without `--unfiled` they are written beside the first
+project only with `--faithful`, and a note on stderr says when they were left out.
 
 ```
 account/

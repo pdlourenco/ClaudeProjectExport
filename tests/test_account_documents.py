@@ -276,18 +276,41 @@ def main():
               proc.returncode == 0 and "WARNING: Could not write the account files" in proc.stderr
               and (blocked / "proj" / "project_knowledge" / "_project_metadata.json").exists(), proc.stderr.strip()[-200:])
 
-        print("\nWithout --unfiled")
+        print("\nEach project's own memory, and only its own")
+        other = {"project_memories": {"b0000000-0000-4000-8000-000000000009": "Another project's secret."},
+                 "conversations_memory": "An account-wide summary."}
+        build_zip(tmp / "p.zip", extra=[("memories/other.json", json.dumps(other))])
         def run_into_project(out, *flags):
             return subprocess.run(
-                [sys.executable, str(EXTRACTOR), str(tmp / "a.zip"), "--extract", "1",
+                [sys.executable, str(EXTRACTOR), str(tmp / "p.zip"), "--extract", "1",
                  "--output", str(out), *flags],
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 env={**os.environ, "PYTHONIOENCODING": "utf-8"})
         alone = tmp / "alone"
         proc = run_into_project(alone)
-        check("a project folder gets none of the account's memory by default",
-              proc.returncode == 0 and not (alone / "account").exists(), proc.stderr.strip()[-160:])
-        check("and the note says how to get it", "--unfiled DIR" in proc.stderr)
+        note = read(alone / "project_knowledge" / "_project_memory.md")
+        check("the project's memory note is written into its folder",
+              proc.returncode == 0 and note.startswith("# Project memory — Garden")
+              and "Track the garden." in note, proc.stderr.strip()[-160:])
+        everything_written = "\n".join(read(f) for f in alone.rglob("*") if f.is_file())
+        check("no other project's memory and no account-wide summary come with it",
+              not (alone / "account").exists() and "Another project's secret." not in everything_written
+              and "vegetable garden" not in everything_written and "account-wide summary" not in everything_written)
+        check("and the note says how to get the rest", "--unfiled DIR" in proc.stderr)
+        with_bucket = tmp / "with_bucket"
+        run(tmp / "p.zip", with_bucket, mapping)
+        check("the project note is written with --unfiled too",
+              "Track the garden." in read(with_bucket / "proj" / "project_knowledge" / "_project_memory.md"))
+        check("while the bucket holds every project's notes",
+              "Another project's secret." in "".join(
+                  read(f) for f in (with_bucket / "unfiled" / "account" / "memory" / "project_memories").iterdir()))
+        with zipfile.ZipFile(tmp / "q.zip", "w") as zf:
+            zf.writestr(f"projects/{PROJECT}.json", json.dumps(project_record()))
+            zf.writestr("conversations.json", json.dumps([CONVERSATION]))
+        run(tmp / "q.zip", tmp / "blank", mapping)
+        check("a project with no memory gets no note",
+              (tmp / "blank" / "proj" / "project_knowledge").is_dir()
+              and not (tmp / "blank" / "proj" / "project_knowledge" / "_project_memory.md").exists())
         everything = tmp / "everything"
         run_into_project(everything, "--faithful")
         check("--faithful still writes it beside the first project",
