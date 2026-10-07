@@ -173,8 +173,11 @@ _unfiled/
 ### Account-level documents
 
 Reflections and memory belong to your account rather than to any project, so they are written
-once — into the `--unfiled` directory if you gave one, otherwise beside the first project —
-under `account/`. They are written by default, not only with `--faithful`:
+once, under `account/`. With `--unfiled` they go into that directory by default, not only with
+`--faithful`. Without `--unfiled` they are written beside the first project only with
+`--faithful`: the memory covers every project, and a project folder handed to Claude Code as
+context should not carry every other project's notes unasked. A note on stderr says when they
+were left out.
 
 ```
 account/

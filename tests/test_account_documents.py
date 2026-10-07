@@ -263,6 +263,23 @@ def main():
               proc.returncode == 0 and "WARNING: Could not write the account files" in proc.stderr
               and (blocked / "proj" / "project_knowledge" / "_project_metadata.json").exists(), proc.stderr.strip()[-200:])
 
+        print("\nWithout --unfiled")
+        def run_into_project(out, *flags):
+            return subprocess.run(
+                [sys.executable, str(EXTRACTOR), str(tmp / "a.zip"), "--extract", "1",
+                 "--output", str(out), *flags],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+        alone = tmp / "alone"
+        proc = run_into_project(alone)
+        check("a project folder gets none of the account's memory by default",
+              proc.returncode == 0 and not (alone / "account").exists(), proc.stderr.strip()[-160:])
+        check("and the note says how to get it", "--unfiled DIR" in proc.stderr)
+        everything = tmp / "everything"
+        run_into_project(everything, "--faithful")
+        check("--faithful still writes it beside the first project",
+              "vegetable garden" in read(everything / "account" / "memory" / "conversations_memory.md"))
+
         print("\nThe older memories.json layout")
         legacy = tmp / "legacy"
         with zipfile.ZipFile(tmp / "i.zip", "w") as zf:

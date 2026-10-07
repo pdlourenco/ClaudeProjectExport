@@ -36,7 +36,8 @@ used as context for Claude Code work.
 ```
 
 Account-level documents — monthly reflections and memory — are written once, under `account/` in
-the `--unfiled` directory (or beside the first project), whether or not `--faithful` is set.
+the `--unfiled` directory, whether or not `--faithful` is set. Without `--unfiled` they are
+written beside the first project only with `--faithful`, since they cover every project.
 
 ## The one thing to get right
 

@@ -1725,7 +1725,8 @@ def main():
         # The unfiled bucket when there is one, otherwise the first project's directory,
         # resolved default included. Account files are not project data, so one copy.
         account_home = Path(args.unfiled) if args.unfiled else plan[0][1]
-        write_account_output(zip_path, account_home, project_names, args.faithful)
+        write_account_output(zip_path, account_home, project_names, args.faithful,
+                             in_project=not args.unfiled)
 
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
@@ -1746,15 +1747,29 @@ def main():
                               faithful=args.faithful)
     if chosen:
         account_home = Path(args.unfiled) if args.unfiled else chosen
-        write_account_output(zip_path, account_home, project_names, args.faithful)
+        write_account_output(zip_path, account_home, project_names, args.faithful,
+                             in_project=not args.unfiled)
         _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
 
 
-def write_account_output(zip_path: Path, destination: Path, project_names, faithful: bool):
+def write_account_output(zip_path: Path, destination: Path, project_names, faithful: bool,
+                         in_project: bool = False):
     """Write everything account-level into destination: the rendered documents, and under
-    --faithful the raw files too. The archive is read once for both."""
+    --faithful the raw files too. The archive is read once for both.
+
+    When destination is a project's own folder, nothing is written unless --faithful asks
+    for everything. The account's memory covers every project, and a project folder is
+    often handed to Claude Code as context; filling it with every other project's notes
+    is not something a plain --extract should do unasked.
+    """
     account = load_account_files(zip_path)
+    if in_project and not faithful:
+        if any(Path(name).name not in RAW_ONLY_ACCOUNT_FILES for name in account):
+            print("\nNOTE: account-level memory and reflections were not written. They cover the "
+                  "whole account, not this project: pass --unfiled DIR to write them there, or "
+                  "--faithful to write them beside the first project.", file=sys.stderr)
+        return
     try:
         if faithful:
             copy_account_files(account, destination)
