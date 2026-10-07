@@ -1725,9 +1725,7 @@ def main():
         # The unfiled bucket when there is one, otherwise the first project's directory,
         # resolved default included. Account files are not project data, so one copy.
         account_home = Path(args.unfiled) if args.unfiled else plan[0][1]
-        if args.faithful:
-            copy_account_files(zip_path, account_home)
-        write_account_documents(zip_path, account_home, project_names)
+        write_account_output(zip_path, account_home, project_names, args.faithful)
 
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
@@ -1748,14 +1746,21 @@ def main():
                               faithful=args.faithful)
     if chosen:
         account_home = Path(args.unfiled) if args.unfiled else chosen
-        if args.faithful:
-            copy_account_files(zip_path, account_home)
-        write_account_documents(zip_path, account_home, project_names)
+        write_account_output(zip_path, account_home, project_names, args.faithful)
         _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
 
 
-def copy_account_files(zip_path: Path, destination: Path):
+def write_account_output(zip_path: Path, destination: Path, project_names, faithful: bool):
+    """Write everything account-level into destination: the rendered documents, and under
+    --faithful the raw files too. The archive is read once for both."""
+    account = load_account_files(zip_path)
+    if faithful:
+        copy_account_files(account, destination)
+    write_account_documents(account, destination, project_names)
+
+
+def copy_account_files(account: dict, destination: Path):
     """Carry across the archive's account-level files, once.
 
     Called only after an extraction plan resolves, so the destination is a directory that
@@ -1763,7 +1768,6 @@ def copy_account_files(zip_path: Path, destination: Path):
     Doing it earlier meant a --json listing wrote files to disk, and a run using default
     directories carried nothing at all, which are the two commonest ways to invoke this.
     """
-    account = load_account_files(zip_path)
     if not account:
         return
     shown = Path(destination) / "raw" / "account"
@@ -1965,7 +1969,7 @@ def _write_memory(blob, root: Path, project_names: dict) -> dict:
     return counts
 
 
-def write_account_documents(zip_path: Path, destination: Path, project_names=None) -> dict:
+def write_account_documents(account: dict, destination: Path, project_names=None) -> dict:
     """Render the account-level files that have something to read, once, into destination.
 
     Reflections and memory are account data, not project data, so like the raw account
@@ -1983,7 +1987,7 @@ def write_account_documents(zip_path: Path, destination: Path, project_names=Non
     project_names = project_names or {}
     totals, unrendered = {}, []
 
-    for name, blob in load_account_files(zip_path).items():
+    for name, blob in account.items():
         if Path(name).name in RAW_ONLY_ACCOUNT_FILES:
             continue
         try:
