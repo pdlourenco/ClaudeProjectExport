@@ -537,6 +537,33 @@ On the export this was built against, 107 files were recovered across 33 convers
 before this, only artifacts reached the output, inlined into the transcript, while every file
 written by `create_file` was silently discarded.
 
+### Can I search the conversations with Obsidian, a static site, or grep?
+
+`--searchable`:
+
+```bash
+python claude_export_extractor.py export.zip --searchable
+```
+
+It writes each transcript for tools that index and filter, and keeps everything else as it is:
+
+- **YAML front matter** instead of the bullet header — `title`, `id`, `project`, `created`,
+  `updated` and `messages`, with dates as ISO timestamps. Obsidian shows them as properties you
+  can filter and sort on; a site generator uses them for the page title and ordering. Titles
+  with colons, quotes, `&` or non-ASCII characters are quoted so the block always parses.
+- **The conversation's own summary**, which Claude.ai writes for each conversation, printed under
+  the title as a block quote. It uses different words from the first messages, so a search for a
+  topic finds the conversation even when the term is deep in the text. (Without `--searchable`
+  the summary is printed only by `--faithful`.)
+- **A snippet in each message heading**, so hits in a long conversation can be told apart:
+  `### HUMAN · 2026-06-01 08:11 UTC — I have a Mx master 3 mouse and a Mx master 3s keyboard…`.
+  The snippet is the first line with words in it, with markdown that would format or link
+  inside a heading removed, cut at a word at about 70 characters. A message with no text keeps
+  a bare heading.
+
+Below the headings the transcript is identical to the one written without the flag. It combines
+with `--faithful`.
+
 ### Can I extract everything, losing nothing?
 
 `--faithful`:

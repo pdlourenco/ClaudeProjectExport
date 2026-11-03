@@ -750,7 +750,8 @@ def _project_keywords(project_name: str) -> list:
 # ── Extraction ────────────────────────────────────────────────────────────────
 
 def extract_project(entry, output_dir: Path, record_strategy: bool = False,
-                    include_thinking: bool = False, faithful: bool = False):
+                    include_thinking: bool = False, faithful: bool = False,
+                    searchable: bool = False):
     """Extract a single project's docs and conversations to the output directory.
 
     record_strategy notes in the saved metadata how the conversations were matched. It is
@@ -827,7 +828,8 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False,
                 conv, conv_names, docs_dir,
                 thinking_dir=(output_dir / "thinking") if include_thinking else None,
                 raw_dir=(output_dir / "raw" / "conversations") if faithful else None,
-                faithful=faithful, files_root=output_dir / "files", counters=stats)
+                faithful=faithful, files_root=output_dir / "files", counters=stats,
+                searchable=searchable, project=entry["name"])
             stats["conversations"] += 1
 
     if faithful and entry.get("source") is not None:
@@ -841,10 +843,92 @@ def extract_project(entry, output_dir: Path, record_strategy: bool = False,
     return stats
 
 
+SNIPPET_CHARS = 70
+
+
+def ts_iso(iso: str) -> str:
+    """An ISO timestamp as UTC to the second, e.g. 2026-06-01T08:11:12Z; "" if unparseable."""
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return ""
+
+
+def _yaml_scalar(value) -> str:
+    """A string as a YAML scalar. A JSON string is a valid double-quoted YAML scalar, so
+    colons, quotes, '&', '#' and non-ASCII titles all survive without a YAML library."""
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def _front_matter(fields) -> list:
+    """Lines of a YAML front-matter block for (key, value) pairs; empty values are left out.
+
+    Numbers and ISO timestamps are written bare so that tools which type properties see a
+    number or a date; everything else is quoted.
+    """
+    lines = ["---"]
+    for key, value in fields:
+        if value is None or value == "":
+            continue
+        bare = isinstance(value, int) or (isinstance(value, str) and re.fullmatch(
+            r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", value))
+        lines.append(f"{key}: {value if bare else _yaml_scalar(value)}")
+    lines.append("---\n")
+    return lines
+
+
+def _quote_block(text: str) -> list:
+    """A multi-paragraph text as a block quote. Every line carries the marker: a quote
+    marker on the first line alone ends at the first blank line."""
+    return [f"> {line}".rstrip() for line in text.splitlines()] + [""]
+
+
+_MARKDOWN_LEAD = re.compile(r"^\s*(?:#{1,6}\s+|>+\s*|[-*+]\s+|\d+[.)]\s+)+")
+
+
+def _heading_snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
+    """A short, single-line label for a message, safe to put in a heading.
+
+    The first line with words in it, stripped of the markdown that would turn into
+    formatting or links inside a heading, and cut at a word boundary. "" if nothing is left.
+    """
+    in_fence = False
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line.startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence or not line or set(line) <= set("-*_=|: "):
+            continue
+        line = _MARKDOWN_LEAD.sub("", line)
+        line = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", line)   # [text](url) -> text
+        line = re.sub(r"<[^>]*>", " ", line)                      # HTML tags
+        line = re.sub(r"[`*~\[\]<>|\\]", "", line)               # what would format or link
+        line = " ".join(line.split())
+        if not re.search(r"\w", line):
+            continue
+        if len(line) <= limit:
+            return line
+        cut = line[:limit]
+        if " " in cut and not line[limit].isspace():
+            cut = cut.rsplit(" ", 1)[0]
+        return cut.rstrip(" ,;:.-—") + "…"
+    return ""
+
+
 def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_dir=None,
                        raw_dir=None, faithful: bool = False, files_root=None,
-                       counters=None) -> int:
+                       counters=None, searchable: bool = False, project=None) -> int:
     """Write one conversation as markdown, via `names`; return its message count.
+
+    `searchable` writes for tools that index and filter: the header becomes YAML front
+    matter (title, id, project, dates, message count), the conversation's own summary is
+    printed even without `faithful`, and each message heading carries a snippet of what the
+    message says, so hits in a long conversation are told apart. `project` names the project
+    the conversation belongs to, for that front matter.
 
     Text content from attachments is written alongside, into attach_dir. The allocator is
     passed in rather than built here so that a whole directory's worth of conversations
@@ -869,16 +953,26 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
     updated = ts(conv.get("updated_at", ""))
     messages = conv.get("chat_messages") or conv.get("messages") or []
 
-    lines = [
-        f"# {title}\n",
-        f"- **ID:** {conv_id}",
-        f"- **Created:** {created}",
-        f"- **Updated:** {updated}",
-        f"- **Messages:** {len(messages)}\n",
-    ]
-    summary = (conv.get("summary") or "").strip() if faithful else ""
+    if searchable:
+        lines = _front_matter([
+            ("title", title), ("id", conv_id), ("project", project),
+            ("created", ts_iso(conv.get("created_at", ""))),
+            ("updated", ts_iso(conv.get("updated_at", ""))),
+            ("messages", len(messages)),
+        ]) + [f"# {title}\n"]
+    else:
+        lines = [
+            f"# {title}\n",
+            f"- **ID:** {conv_id}",
+            f"- **Created:** {created}",
+            f"- **Updated:** {updated}",
+            f"- **Messages:** {len(messages)}\n",
+        ]
+    summary = (conv.get("summary") or "").strip() if (faithful or searchable) else ""
     if summary:
-        lines.append(f"> {summary}\n")
+        # The block-quote form is for the new layout only: --faithful has always printed the
+        # summary behind a single marker, and that output is left as it was.
+        lines.extend(_quote_block(summary) if searchable else [f"> {summary}\n"])
 
     # The transcript's name is claimed before its body is built, because the files this
     # conversation produced are filed under that name and the markers pointing at them are
@@ -955,7 +1049,11 @@ def write_conversation(conv, names: NameAllocator, attach_dir: Path, thinking_di
                     att_path.write_text(att_content, encoding="utf-8",
                                         errors="backslashreplace")
 
-        lines.append(f"### {role}  _{msg_ts}_\n")
+        if searchable:
+            label = _heading_snippet(content)
+            lines.append(f"### {role} · {msg_ts}" + (f" — {label}" if label else "") + "\n")
+        else:
+            lines.append(f"### {role}  _{msg_ts}_\n")
         if content:
             lines.append(content.strip())
             lines.append("")
@@ -1288,7 +1386,7 @@ def strategy_counts(index):
 
 
 def extract_unfiled(conversations, output_dir: Path, include_thinking: bool = False,
-                    faithful: bool = False):
+                    faithful: bool = False, searchable: bool = False):
     """Write every unfiled conversation into a single bucket directory."""
     output_dir = _extended(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1300,7 +1398,8 @@ def extract_unfiled(conversations, output_dir: Path, include_thinking: bool = Fa
             conv, names, output_dir / "attachments",
             thinking_dir=(output_dir / "thinking") if include_thinking else None,
             raw_dir=(output_dir / "raw" / "conversations") if faithful else None,
-            faithful=faithful, files_root=output_dir / "files", counters=stats)
+            faithful=faithful, files_root=output_dir / "files", counters=stats,
+            searchable=searchable)
         stats["conversations"] += 1
 
     return stats
@@ -1702,10 +1801,12 @@ def assert_distinct_dirs(plan):
 
 
 def extract_or_exit(entry, out_dir: Path, record_strategy: bool = False,
-                    include_thinking: bool = False, faithful: bool = False):
+                    include_thinking: bool = False, faithful: bool = False,
+                    searchable: bool = False):
     """Extract one project, turning filesystem refusals into a one-line error."""
     try:
-        return extract_project(entry, out_dir, record_strategy, include_thinking, faithful)
+        return extract_project(entry, out_dir, record_strategy, include_thinking, faithful,
+                               searchable)
     except OSError as exc:
         print(f"ERROR: Cannot write to {out_dir}: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -1722,7 +1823,7 @@ def print_stats(stats):
 
 
 def interactive_mode(index, show_strategy: bool = False, include_thinking: bool = False,
-                     faithful: bool = False):
+                     faithful: bool = False, searchable: bool = False):
     """Run interactive project selection and extraction."""
     print_project_list(index, show_strategy)
 
@@ -1781,7 +1882,8 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
     # Extract
     for entry, out_dir in extractions:
         print(f"\nExtracting: {entry['name']} -> {out_dir}")
-        stats = extract_or_exit(entry, out_dir, show_strategy, include_thinking, faithful)
+        stats = extract_or_exit(entry, out_dir, show_strategy, include_thinking, faithful,
+                                searchable)
         print_stats(stats)
 
     # The first directory, so a caller wanting somewhere to put run-level files has one.
@@ -1823,6 +1925,13 @@ def main():
                              "and writes every source record verbatim to raw/ so that fields "
                              "this tool does not render — including ones added in future — "
                              "survive extraction.")
+    parser.add_argument("--searchable", action="store_true",
+                        help="Write each conversation for tools that index and filter it "
+                             "(Obsidian, a static site, grep): YAML front matter in place of "
+                             "the bullet header (title, id, project, dates, message count), "
+                             "the conversation's own summary under it, and a snippet of the "
+                             "message in each message heading so hits in a long conversation "
+                             "are told apart. Does not change what is kept.")
     parser.add_argument("--thinking", action="store_true",
                         help="Also write Claude's reasoning to a thinking/ folder beside the "
                              "conversations, one file per conversation, same filenames. Omitted "
@@ -1984,23 +2093,26 @@ def main():
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
             stats = extract_or_exit(entry, out_dir, mapping is not None,
-                                    args.thinking or args.faithful, args.faithful)
+                                    args.thinking or args.faithful, args.faithful,
+                                    args.searchable)
             print_stats(stats)
 
-        _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
+        _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful,
+                         args.searchable)
         print("\nDone!")
         return
 
     # Interactive mode
     chosen = interactive_mode(index, show_strategy=mapping is not None,
                               include_thinking=args.thinking or args.faithful,
-                              faithful=args.faithful)
+                              faithful=args.faithful, searchable=args.searchable)
     if chosen:
         account_home = Path(args.unfiled) if args.unfiled else chosen
         write_account_output(account, account_home, project_names, args.faithful,
                              in_project=not args.unfiled, archive=archive,
                              conversations=conversations)
-        _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
+        _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful,
+                         args.searchable)
         print("\nDone!")
 
 
@@ -2915,13 +3027,13 @@ def write_artifacts(archive, groups: dict, destination: Path, faithful: bool, co
 
 
 def _extract_unfiled(unfiled_dir, unfiled, include_thinking: bool = False,
-                     faithful: bool = False):
+                     faithful: bool = False, searchable: bool = False):
     """Write the unfiled bucket, if one was asked for."""
     if not unfiled_dir:
         return
     out_dir = Path(unfiled_dir)
     print(f"\nExtracting unfiled conversations -> {out_dir}")
-    stats = extract_unfiled(unfiled, out_dir, include_thinking, faithful)
+    stats = extract_unfiled(unfiled, out_dir, include_thinking, faithful, searchable)
     print(f"  {stats['conversations']} conversations ({stats['convs_msgs']} messages)")
     if stats.get("files"):
         print(f"  {stats['files']} files Claude produced")
