@@ -128,6 +128,7 @@ def add_typed(zf, artifact_id, title, versions, active, tamper=(), skip_files=()
 ROUTINES = {"claude_code_cloud": [
     {"routine_id": ROUTINE, "agent_id": "agent_1", "name": "Weekly check", "enabled": True,
      "prompt": "Look at the `build` and say ```so``` if it is red.", "prompt_withheld": False,
+     "session_id": None, "scheduled_for": None,
      "schedule": {"cron": "0 9 * * 1", "run_once_at": None},
      "created_at": "2026-10-01T08:00:00Z", "updated_at": "2026-10-01T08:00:00Z", "ended_at": None},
     {"routine_id": "trig_invented_once", "agent_id": "agent_1", "name": "One-off nudge", "enabled": False,
@@ -211,6 +212,8 @@ def snapshot(directory: Path) -> dict:
 # ── The checks ────────────────────────────────────────────────────────────────
 
 def main():
+    # A detail line can hold a name the console's code page cannot encode.
+    sys.stdout.reconfigure(errors="backslashreplace")
     module = load_module()
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -231,6 +234,25 @@ def main():
         reversed_ = extract(list(reversed(zips)), tmp / "by_reversed", mapping)
         check("and the order they are named in does not matter",
               reversed_.returncode == 0 and snapshot(tmp / "by_folder") == snapshot(tmp / "by_reversed"))
+
+        twice = extract([export, export / "frames-000.zip"], tmp / "twice", mapping)
+        check("a zip named twice, as a folder and as a file in it, is read once",
+              twice.returncode == 0 and "Loading: 5 archives" in twice.stdout, twice.stdout.splitlines()[0])
+        globbed = extract([*zips, export / "manifest-invented-2026-11-03.json", export / "notes.txt"],
+                          tmp / "globbed", mapping)
+        check("a shell glob over the folder works: files that are no zip are skipped with a warning",
+              globbed.returncode == 0 and "Loading: 5 archives" in globbed.stdout
+              and "skipping" in globbed.stderr and "notes.txt" in globbed.stderr, globbed.stderr.strip()[:200])
+        (tmp / "garbage.txt").write_text("not a zip", encoding="utf-8")
+        lone = cli(tmp / "garbage.txt")
+        check("a lone file that is no zip is still reported as one",
+              lone.returncode == 1 and "Not a ZIP file" in lone.stderr and "garbage.txt" in lone.stderr,
+              lone.stderr.strip()[:200])
+        bare = tmp / "no_extension"
+        bare.write_bytes(zips[0].read_bytes())
+        extensionless = cli(bare, "--json", mapping=mapping)
+        check("a zip saved without its extension is still read", "Not a ZIP" not in extensionless.stderr
+              and "skipping" not in extensionless.stderr, extensionless.stderr.strip()[:160])
 
         one = tmp / "one.zip"
         with zipfile.ZipFile(one, "w", zipfile.ZIP_DEFLATED) as out:
@@ -312,6 +334,8 @@ def main():
         check("a routine with no runs says so", "## Runs (0)" in once and "None in this export" in once)
         orphans = read(routines / "_runs_without_routine.md")
         check("a run whose routine is not in the export is kept", GONE in orphans and "skipped" in orphans)
+        check("a routine with a null session_id of its own is not mistaken for a run",
+              ROUTINE not in orphans and "## Runs (2)" in weekly)
         index = read(routines / "_index.md")
         check("an index lists the routines", "Weekly check" in index and "One-off nudge" in index)
         check("and the summary counts them", "2 routines, 3 routine runs" in folder.stdout, folder.stdout[-400:])
@@ -358,6 +382,8 @@ def main():
             md = read(tmp / "broken_out" / "unfiled" / "account" / "artifacts" / "Broken Deck" / "_versions.md")
             check("and is listed in the artifact's index", "Files that failed verification" in md and expected in md)
             check("and counted in the summary", "1 failed verification" in run.stdout, run.stdout[-200:])
+            check("without taking a file that was never verified off the count of those that were",
+                  "19 files verified" in run.stdout, run.stdout[-200:])
             shutil.rmtree(tmp / "broken")
             shutil.rmtree(tmp / "broken_out")
 
@@ -376,6 +402,7 @@ def main():
             ("artifacts/e4/artifact.json", json.dumps({"active_version": ["x"], "updated_at": {"a": 1},
                                                        "versions": [{"id": {"a": 1}}, "text", {"id": "w1", "title": 7}]})),
             ("artifacts/e4/versions/w1.html", "<p>wrong types</p>"),
+            ("artifacts/e5/versions/" + "\u597d" * 120 + ".html", "<p>long name</p>"),
         ]})
         run = extract(weird, tmp / "weird_out", mapping)
         out = tmp / "weird_out" / "unfiled" / "account" / "artifacts"
@@ -389,12 +416,26 @@ def main():
         check("a current version that is not in the archive falls back to the newest, and says so",
               "g9" in gone and "not in the archive" in gone and read(out / "Gone Active" / "Gone Active.html") == "<p>g2</p>")
         check("an artifact with no artifact.json is still written", read(out / "e2" / "e2.html") == "<p>no record</p>")
+        guess = read(out / "e2" / "_versions.md")
+        check("and with nothing to say which version is current, none is called current",
+              "not recorded" in guess and "(current)" not in guess and "highest version id" in guess, guess[:300])
+        check("a version named by its record is still called current",
+              "(current)" in read(out / "Gone Active" / "_versions.md") or "g2 **(current)**" in read(out / "Gone Active" / "_versions.md"))
         check("fields of the wrong type are tolerated and the page still written",
               read(out / "e4" / "e4.html") == "<p>wrong types</p>" and "_versions.md" in {p.name for p in (out / "e4").iterdir()},
               str(sorted(p.name for p in out.iterdir())))
         check("two artifacts with one title both survive",
               read(out / "Music Room" / "Music Room.html") == "<p>current</p>"
               and read(out / "Music Room_1" / "Music Room.html") == "<p>same title</p>", str(sorted(p.name for p in out.iterdir())))
+
+        long_run = extract(weird, tmp / "weird_faithful", mapping, "--faithful")
+        raw_e5 = tmp / "weird_faithful" / "unfiled" / "raw" / "artifacts" / "e5" / "versions"
+        names = [p.name for p in raw_e5.iterdir()] if raw_e5.is_dir() else []
+        check("a name too long in bytes, though not in characters, is shortened rather than stopping the run",
+              long_run.returncode == 0 and "Could not write" not in long_run.stderr and len(names) == 1
+              and len(names[0].encode("utf-8")) <= 255 and names[0].endswith(".html"), str(names)[:120])
+        check("and the files after it are still copied", (tmp / "weird_faithful" / "unfiled" / "raw" / "artifacts"
+                                                          / "e3" / "versions" / "m1.html").exists())
 
         nopj = tmp / "nopj"
         nopj.mkdir()
@@ -407,6 +448,36 @@ def main():
         check("a typed version without project/ falls back to its page and says so",
               run.returncode == 0 and read(bare / "index.html").startswith("<!doctype html>")
               and "no project/ folder" in read(bare / "_versions.md"))
+
+        print("\nA damaged entry in the archive")
+        hurt = tmp / "hurt"
+        hurt.mkdir()
+        with zipfile.ZipFile(hurt / "projects-000.zip", "w") as zf:
+            zf.writestr(f"projects/{PROJECT}.json", json.dumps(project_record()))
+        with zipfile.ZipFile(hurt / "frames-000.zip", "w") as zf:
+            add_typed(zf, DECK_ID, "Sun Deck", ["d1", "d2"], "d2")
+        member = f"artifacts/{DECK_ID}/versions/d2/project/deck.json"
+        with zipfile.ZipFile(hurt / "frames-000.zip") as zf:
+            info = zf.getinfo(member)
+        raw_bytes = bytearray((hurt / "frames-000.zip").read_bytes())
+        raw_bytes[info.header_offset + 30 + len(member.encode("utf-8")) + len(info.extra)] ^= 0xFF
+        (hurt / "frames-000.zip").write_bytes(bytes(raw_bytes))
+        for flags in ((), ("--faithful",)):
+            label = "with --faithful" if flags else "by default"
+            run = extract(hurt, tmp / ("hurt_out" + "".join(flags)), mapping, *flags)
+            check(f"a failed CRC is a warning, not a traceback ({label})", run.returncode == 0
+                  and "Traceback" not in run.stderr and "deck.json" in run.stderr and "damaged" in run.stderr,
+                  run.stderr.strip()[:240])
+            check(f"the projects are still extracted ({label})", "Extracting: Garden" in run.stdout)
+            sun = tmp / ("hurt_out" + "".join(flags)) / "unfiled" / "account" / "artifacts" / "Sun Deck"
+            check(f"the rest of the artifact is still written ({label})",
+                  read(sun / "slides" / "a.html") == "<h1>slide in d2</h1>" and not (sun / "deck.json").exists())
+            check(f"and it is listed among the files that failed verification ({label})",
+                  "Files that failed verification" in read(sun / "_versions.md")
+                  and "damaged" in read(sun / "_versions.md"))
+        raw_deck = tmp / "hurt_out--faithful" / "unfiled" / "raw" / "artifacts" / DECK_ID / "versions" / "d2"
+        check("no half-written copy of the damaged file is left under raw/",
+              not (raw_deck / "project" / "deck.json").exists() and (raw_deck / "project" / "slides" / "a.html").exists())
 
         print("\nWhat --faithful keeps")
         faithful = extract(export, tmp / "faithful", mapping, "--faithful")

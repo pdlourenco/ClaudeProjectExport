@@ -39,6 +39,7 @@ import contextlib
 import hashlib
 import shutil
 import zipfile
+import zlib
 import json
 import re
 import sys
@@ -228,11 +229,22 @@ def expand_sources(sources) -> list:
     """The zip files named by `sources`: a path, or a list of them, each a zip or a folder.
 
     A folder stands for every .zip directly inside it, in name order. Anything else in it —
-    the download manifest, a mapping file, notes — is not an archive and is left alone.
+    the download manifest, a mapping file, notes — is not an archive and is left alone. A file
+    named on its own gets the same filter: it is taken if it is called .zip or is a zip (an
+    export saved without its extension), and skipped with a warning otherwise, so that
+    `export-folder/*` and `export-folder/` mean the same thing. Each zip is returned once,
+    however many ways it was named.
     """
     if isinstance(sources, (str, Path)):
         sources = [sources]
-    zips = []
+    zips, seen, skipped = [], set(), []
+
+    def add(path):
+        key = path.resolve()
+        if key not in seen:
+            seen.add(key)
+            zips.append(path)
+
     for source in sources:
         source = Path(source)
         if source.is_dir():
@@ -240,12 +252,35 @@ def expand_sources(sources) -> list:
                            key=lambda p: p.name.lower())
             if not found:
                 raise ExportError(f"No .zip files in {source}")
-            zips.extend(found)
+            for path in found:
+                add(path)
         elif source.exists():
-            zips.append(source)
+            if source.suffix.lower() == ".zip" or zipfile.is_zipfile(source):
+                add(source)
+            else:
+                skipped.append(source)
+                print(f"WARNING: skipping {source}: not a zip file", file=sys.stderr)
         else:
             raise FileNotFoundError(str(source))
+    if not zips:
+        if len(skipped) == 1:
+            # A lone file that is no zip has always been reported as exactly that.
+            raise zipfile.BadZipFile(str(skipped[0]))
+        raise ExportError("No zip files among: " + ", ".join(str(s) for s in skipped))
     return zips
+
+
+def _same_content(zf_a, info_a, zf_b, info_b) -> bool:
+    """Whether two archive entries hold the same bytes, read a megabyte at a time."""
+    if (info_a.file_size, info_a.CRC) != (info_b.file_size, info_b.CRC):
+        return False
+    with zf_a.open(info_a) as a, zf_b.open(info_b) as b:
+        while True:
+            chunk = a.read(1 << 20)
+            if chunk != b.read(len(chunk)):
+                return False
+            if not chunk:
+                return True
 
 
 class ExportArchive:
@@ -285,8 +320,7 @@ class ExportArchive:
             self._where[info.filename] = (path, zf, info)
             return
         first_path, first_zf, first_info = seen
-        if (first_info.file_size, first_info.CRC) != (info.file_size, info.CRC) \
-                or first_zf.read(first_info) != zf.read(info):
+        if not _same_content(first_zf, first_info, zf, info):
             raise ExportError(f"{info.filename} is in both {first_path.name} and {path.name}, "
                               f"with different content")
 
@@ -455,8 +489,9 @@ def _artifact_parts(name: str):
     """(artifact id, path inside the artifact) for an entry in a published-artifact tree, else None.
 
     The tree is artifacts/<id>/artifact.json beside artifacts/<id>/versions/…, possibly
-    under a folder the archive nests everything in. Both halves are required, so a folder
-    that merely happens to be called "artifacts" is not mistaken for one.
+    under a folder the archive nests everything in. Either marker is enough, so an artifact
+    whose artifact.json is missing is still read as one; a folder that merely happens to be
+    called "artifacts", holding neither, is not mistaken for one.
     """
     parts = _path_segments(name)
     for i in range(len(parts) - 2):
@@ -1812,6 +1847,9 @@ def main():
             sys.exit(1)
     try:
         zips = expand_sources(sources)
+    except zipfile.BadZipFile as exc:
+        print(f"ERROR: Not a ZIP file (or the download is corrupt): {exc}", file=sys.stderr)
+        sys.exit(1)
     except ExportError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -2001,7 +2039,7 @@ def write_account_output(account: dict, destination: Path, project_names, faithf
         _note_unread(unread, faithful)
         if faithful and unread:
             copy_unread_entries(archive, unread, destination)
-    except OSError as exc:
+    except (OSError, *_UNREADABLE) as exc:
         # Account files are not project data, so failing to write them is reported and the
         # projects are still extracted, rather than ending the run before any project is.
         print(f"WARNING: Could not write the account files to {destination}: {exc}",
@@ -2284,16 +2322,24 @@ class _AccountDocuments:
             self.memory_files.extend(r for r in files
                                      if isinstance(r, dict) and isinstance(r.get("content"), str))
 
-    def add_routines(self, blob):
+    def add_routines(self, blob, source: str = ""):
         """The scheduled routines and their runs, which the export keeps in separate files.
 
-        routines.json and routine_runs.json both hold a claude_code_cloud list, so a record
-        is told apart by what it carries, and the two are joined on routine_id in finish().
+        routines.json and routine_runs.json both hold a claude_code_cloud list, and are joined
+        on routine_id in finish(). The file's name says which kind of record it holds; the keys
+        a record carries decide only when the name does not. A routine with a session_id or
+        scheduled_for of its own, even null, is still a routine.
         """
+        stem = Path(source).stem.lower()
+        kind = "runs" if "run" in stem else "routines" if "routine" in stem else ""
         items = blob.get("claude_code_cloud")
         for item in items if isinstance(items, list) else []:
             if not isinstance(item, dict):
                 self.cloud_other.append(item)
+            elif kind == "runs":
+                self.runs.append(item)
+            elif kind == "routines":
+                self.routines.append(item)
             elif "scheduled_for" in item or "session_id" in item:
                 self.runs.append(item)
             elif any(k in item for k in ("name", "prompt", "schedule", "enabled")):
@@ -2472,7 +2518,7 @@ def write_account_documents(account: dict, destination: Path, project_names=None
                 documents.add_memory(record)
             if isinstance(record.get("claude_code_cloud"), list):
                 recognised = True
-                documents.add_routines(record)
+                documents.add_routines(record, name)
         if not recognised:
             unrendered.append(name)
     documents.finish()
@@ -2524,32 +2570,55 @@ def _copy_entries(archive, items, target: Path) -> int:
     """Write archive entries verbatim under `target`; `items` is [(entry name, path segments)].
 
     The segments came from an archive, which is not a trustworthy source of file paths, so
-    each is sanitized on the way out. Two entries that sanitize to the same path (case
-    aside) are both kept, the later one as name_1.ext, rather than one overwriting the other.
+    each is sanitized on the way out, and kept short enough in bytes for any filesystem.
+    Two entries that sanitize to the same path (case aside) are both kept, the later one as
+    name_1.ext, rather than one overwriting the other. Returns how many were copied; a damaged
+    entry is a warning and is not counted.
     """
-    taken = set()
+    allocators = {}
     count = 0
     for name, segments in items:
-        parts = [safe_name(part, 200) for part in segments]
-        stem, dot, ext = parts[-1].rpartition(".")
-        counter = 0
-        while True:
-            last = parts[-1] if not counter else (f"{stem}_{counter}.{ext}" if dot else f"{parts[-1]}_{counter}")
-            key = "/".join([*parts[:-1], last]).casefold()
-            if key not in taken:
-                break
-            counter += 1
-        taken.add(key)
-        out_path = target.joinpath(*parts[:-1], last)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        _copy_one(archive, name, out_path)
-        count += 1
+        parts = [_fit_bytes(part) for part in segments]
+        directory = target.joinpath(*parts[:-1])
+        key = str(directory).casefold()
+        if key not in allocators:
+            directory.mkdir(parents=True, exist_ok=True)
+            allocators[key] = NameAllocator(directory)
+        count += _copy_one(archive, name, allocators[key].allocate(parts[-1]))
     return count
 
 
-def _copy_one(archive, name: str, out_path: Path):
-    with archive.open(name) as src, open(out_path, "wb") as dst:
-        shutil.copyfileobj(src, dst)
+def _fit_bytes(part: str, budget: int = 200) -> str:
+    """`part` made safe as a file name and short enough in UTF-8 bytes.
+
+    Most filesystems cap a name at 255 bytes, not characters, and a name in an alphabet that
+    takes three bytes a character is over it at a third of the length. The extension is kept.
+    """
+    limit = budget
+    candidate = safe_filename(part, limit)
+    while len(candidate.encode("utf-8")) > budget and limit > 1:
+        limit -= 1
+        candidate = safe_filename(part, limit)
+    return candidate
+
+
+# What reading a damaged entry out of a zip can raise: a failed CRC, a truncated stream, a
+# compression method the zipfile module lacks. None of them is an OSError.
+_UNREADABLE = (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError)
+
+
+def _copy_one(archive, name: str, out_path: Path) -> bool:
+    """Copy one entry out of the archive. A damaged entry is a warning and False, with no
+    half-written file left behind, so that one bad file does not cost the rest."""
+    try:
+        with archive.open(name) as src, open(out_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    except _UNREADABLE as exc:
+        with contextlib.suppress(OSError):
+            out_path.unlink()
+        print(f"WARNING: {name} is damaged in the archive and was not copied: {exc}", file=sys.stderr)
+        return False
+    return True
 
 
 def copy_unread_entries(archive, names, destination: Path):
@@ -2591,27 +2660,44 @@ def _listed_versions(meta: dict) -> list:
         if isinstance(listed, list) else []
 
 
-def _active_version(meta: dict, versions: dict):
-    """The version the artifact currently shows: the one it names, else the newest it has."""
+def _id_order(version: str) -> tuple:
+    """Version ids start with the time they were made (1793690454-8755), so by that number."""
+    head = version.split("-", 1)[0]
+    return (1, int(head), version) if head.isdigit() else (0, 0, version)
+
+
+def _active_version(meta: dict, versions: dict) -> tuple:
+    """(the version the artifact shows, how that was decided).
+
+    The decision is "named" when artifact.json names it, "dated" when it is the newest by
+    created_at among those it lists, and "id" when there is no usable record and the version
+    with the highest id is a guess. A guess is shown but not called current.
+    """
     wanted = meta.get("active_version")
     if isinstance(wanted, str) and wanted in versions:
-        return wanted
+        return wanted, "named"
     present = [v for v in _listed_versions(meta) if v["id"] in versions]
     if present:
-        return max(present, key=lambda v: str(v.get("created_at") or ""))["id"]
-    return max(versions) if versions else None
+        return max(present, key=lambda v: str(v.get("created_at") or ""))["id"], "dated"
+    return (max(versions, key=_id_order), "id") if versions else (None, "id")
 
 
 def _verify_version(archive, files: dict, version: str, manifest) -> tuple:
-    """(files checked, problems) for one typed version against the hashes its manifest records."""
+    """(files verified, problems) for one typed version against the hashes its manifest records.
+
+    A file counts as verified only when its hash matches; one that differs, is missing, or
+    cannot be read is a problem and is not counted.
+    """
     try:
         data = json.loads(archive.read(files[manifest]))
     except ValueError:
         return 0, ["its files manifest is not valid JSON"]
+    except _UNREADABLE:
+        return 0, ["its files manifest is damaged in the archive"]
     entries = data.get("files") if isinstance(data, dict) else data
     if not isinstance(entries, list):
         return 0, ["its files manifest has no file list"]
-    checked, problems = 0, []
+    verified, problems = 0, []
     for entry in entries:
         if not isinstance(entry, dict) or not entry.get("exported_as") or not entry.get("sha256"):
             continue
@@ -2620,27 +2706,35 @@ def _verify_version(archive, files: dict, version: str, manifest) -> tuple:
             problems.append(f"{entry['exported_as']} is in the manifest but not in the archive")
             continue
         digest = hashlib.sha256()
-        with archive.open(name) as stream:
-            for chunk in iter(lambda: stream.read(1 << 20), b""):
-                digest.update(chunk)
-        checked += 1
+        try:
+            with archive.open(name) as stream:
+                for chunk in iter(lambda: stream.read(1 << 20), b""):
+                    digest.update(chunk)
+        except _UNREADABLE:
+            problems.append(f"{entry['exported_as']} is damaged in the archive and could not be read")
+            continue
         if digest.hexdigest() != str(entry["sha256"]).strip().lower():
             problems.append(f"{entry['exported_as']} does not match the sha256 recorded for it")
-    return checked, problems
+        else:
+            verified += 1
+    return verified, problems
 
 
 def _artifact_mentions(conversations, ids) -> dict:
     """artifact id -> the conversations whose record contains it."""
     mentions = {artifact_id: [] for artifact_id in ids}
+    if not mentions:
+        return mentions
+    # One alternation, longest first, so each conversation is scanned once however many
+    # artifacts there are.
+    pattern = re.compile("|".join(re.escape(i) for i in sorted(mentions, key=len, reverse=True)))
     for conv in conversations:
-        text = json.dumps(conv, ensure_ascii=False)
-        for artifact_id in ids:
-            if artifact_id in text:
-                mentions[artifact_id].append(conv)
+        for artifact_id in set(pattern.findall(json.dumps(conv, ensure_ascii=False))):
+            mentions[artifact_id].append(conv)
     return mentions
 
 
-def _render_artifact_index(artifact_id, meta, title, versions, active, checks, mentions,
+def _render_artifact_index(artifact_id, meta, title, versions, active, basis, checks, mentions,
                            notes, wrote_project, faithful) -> str:
     listed = {v["id"]: v for v in _listed_versions(meta)}
     lines = [f"# {title}\n", f"- **Artifact:** {artifact_id}"]
@@ -2648,7 +2742,10 @@ def _render_artifact_index(artifact_id, meta, title, versions, active, checks, m
         lines.append(f"- **Visibility:** {meta['visibility']}")
     if meta.get("updated_at"):
         lines.append(f"- **Updated:** {ts(str(meta['updated_at']))}")
-    lines.append(f"- **Current version:** {active or '(none in the archive)'}")
+    if basis == "id" and active:
+        lines.append(f"- **Current version:** not recorded; {active} is shown, as the highest version id")
+    else:
+        lines.append(f"- **Current version:** {active or '(none in the archive)'}")
     lines.extend(f"- **Note:** {note}" for note in notes)
     lines.append("")
 
@@ -2667,7 +2764,7 @@ def _render_artifact_index(artifact_id, meta, title, versions, active, checks, m
             content = f"{project} project files + the type's runtime" if slot["tree"] else "manifest only"
         checked, problems = checks.get(version, (0, []))
         status = (f"{len(problems)} failed" if problems else f"{checked} files" if checked else "")
-        mark = " **(current)**" if version == active else ""
+        mark = " **(current)**" if version == active and basis != "id" else ""
         lines.append("| " + " | ".join(_table_cell(str(c)) for c in (
             f"{version}{mark}", ts(str(info.get("created_at") or "")), info.get("title") or "",
             info.get("description") or "", content, status)) + " |")
@@ -2691,8 +2788,9 @@ def _render_artifact_index(artifact_id, meta, title, versions, active, checks, m
             lines.append(f"- … and {len(mentions) - 25} more")
         lines.append("")
 
-    lines.append("The current version's content is in this folder." if wrote_project
-                 else "No content could be written for the current version.")
+    shown = "current" if basis != "id" else "highest-id"
+    lines.append(f"The {shown} version's content is in this folder." if wrote_project
+                 else f"No content could be written for the {shown} version.")
     lines.append("Every version is kept byte for byte under raw/artifacts/." if faithful
                  else "Only the current version is written; pass --faithful to keep every version, "
                       "byte for byte, under raw/artifacts/.")
@@ -2731,14 +2829,19 @@ def write_artifacts(archive, groups: dict, destination: Path, faithful: bool, co
                 meta = loaded if isinstance(loaded, dict) else {}
             except ValueError:
                 notes.append("artifact.json is not valid JSON, so titles and dates are unknown.")
+            except _UNREADABLE:
+                notes.append("artifact.json is damaged in the archive, so titles and dates are unknown.")
         else:
             notes.append("The archive has no artifact.json for this artifact.")
 
         versions = _artifact_versions(files)
-        active = _active_version(meta, versions)
+        active, basis = _active_version(meta, versions)
         named = meta.get("active_version")
         if named and not (isinstance(named, str) and named in versions):
             notes.append(f"The version it names as current ({named}) is not in the archive.")
+        elif basis == "id" and active:
+            notes.append("artifact.json does not say which version is current, so the one with "
+                         "the highest id is shown.")
         listed = {v["id"]: v for v in _listed_versions(meta)}
         title = (_as_text(listed.get(active, {}).get("title"))
                  or next((_as_text(v.get("title")) for v in listed.values() if _as_text(v.get("title"))), "")
@@ -2748,8 +2851,8 @@ def write_artifacts(archive, groups: dict, destination: Path, faithful: bool, co
         for version, slot in versions.items():
             if slot["manifest"]:
                 checks[version] = _verify_version(archive, files, version, slot["manifest"])
-        for version, (checked, problems) in checks.items():
-            totals["files verified"] += checked - len(problems)
+        for version, (verified, problems) in checks.items():
+            totals["files verified"] += verified
             totals["failed verification"] += len(problems)
             for problem in problems[:5]:
                 print(f"WARNING: artifact {title!r}, version {version}: {problem}", file=sys.stderr)
@@ -2769,8 +2872,7 @@ def write_artifacts(archive, groups: dict, destination: Path, faithful: bool, co
         if slot:
             if slot["page"]:
                 suffix = Path(slot["page"][-1]).suffix or ".html"
-                _copy_one(archive, files[slot["page"]], place(folder, safe_filename(title + suffix)))
-                wrote += 1
+                wrote += _copy_one(archive, files[slot["page"]], place(folder, safe_filename(title + suffix)))
             project = {rest[1:]: inner for rest, inner in slot["tree"].items()
                        if rest[0].lower() == "project" and len(rest) > 1}
             if slot["tree"] and not project:
@@ -2782,11 +2884,10 @@ def write_artifacts(archive, groups: dict, destination: Path, faithful: bool, co
                 notes.append("The current version has no project/ folder.")
             for rest, inner in sorted(project.items()):
                 directory = folder.joinpath(*[safe_name(p) for p in rest[:-1]])
-                _copy_one(archive, files[inner], place(directory, safe_filename(rest[-1])))
-                wrote += 1
+                wrote += _copy_one(archive, files[inner], place(directory, safe_filename(rest[-1])))
 
         (folder / "_versions.md").write_text(
-            _render_artifact_index(artifact_id, meta, title, versions, active, checks,
+            _render_artifact_index(artifact_id, meta, title, versions, active, basis, checks,
                                    mentions[artifact_id], notes, bool(wrote), faithful),
             encoding="utf-8", errors="backslashreplace")
 
