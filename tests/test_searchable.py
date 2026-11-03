@@ -138,6 +138,27 @@ def main():
     check("a word longer than the limit is cut hard rather than lost", snip("x" * 200).endswith("…")
           and len(snip("x" * 200)) == 71)
     check("the snippet is never more than one line", "\n" not in snip("a\nb") and "|" not in snip("a | b"))
+    check("a fence opened and closed on one line is not a fence",
+          snip("```bash ls```\nHello there friend") == "bash ls"
+          and snip("```bash\nls\n```\nHello there friend") == "Hello there friend")
+    check("a longer fence is closed only by an equally long one",
+          snip("````\n```\ninside\n```\n````\nafter it") == "after it"
+          and snip("~~~\ncode\n~~~\nafter it") == "after it")
+    check("an unclosed fence leaves nothing rather than the code", snip("```\nnever closed\nstill code") == "")
+    check("comparisons and generics keep their words, only real tags are taken out",
+          snip("if a < b and c > d then fail") == "if a b and c d then fail"
+          and snip("x<5 or y>3") == "x5 or y3"
+          and snip("Map<String, Int> and <em>this</em> and <!-- hidden --> <br/> end") == "MapString, Int and this and end",
+          snip("Map<String, Int> and <em>this</em> and <!-- hidden --> <br/> end"))
+    check("a hash that would become a tag or end the heading is escaped, a C# is left alone",
+          snip("#rust how do I borrow") == "\\#rust how do I borrow"
+          and snip("What is C #") == "What is C \\#" and snip("Is C# any good") == "Is C# any good")
+    check("maths, highlights, comments and emphasis are escaped, snake_case is left alone",
+          snip("costs $5 and $10") == "costs \\$5 and \\$10" and snip("a ==b== c") == "a \\=\\=b\\=\\= c"
+          and snip("x %%hidden%% y") == "x \\%\\%hidden\\%\\% y" and snip("say _this_ now") == "say \\_this\\_ now"
+          and snip("use snake_case_names") == "use snake_case_names")
+    dots = snip("." * 75 + "a")
+    check("a first line of punctuation is cut hard rather than stripped away", dots == "." * 70 + "…", dots)
 
     print("\nFront matter")
     fm = mod._front_matter
@@ -152,6 +173,21 @@ def main():
           and mod.ts_iso("2026-05-01T08:00:00.123456Z") == "2026-05-01T08:00:00Z"
           and mod.ts_iso("2026-05-01T10:00:00+02:00") == "2026-05-01T08:00:00Z")
     check("a block quote carries the marker on every line", mod._quote_block("a\n\nb") == ["> a", ">", "> b", ""])
+    nasty = "Bad\x7ftitle \x85next  sep  para ﻿bom ￾￿ \x80\x9f \ud800 end 😀 é"
+    line = fm([("title", nasty)])[1]
+    forbidden = [c for c in line if ord(c) in range(0x7f, 0xa0) or c in "  ﻿￾￿"
+                 or 0xd800 <= ord(c) <= 0xdfff]
+    check("characters YAML cannot hold are escaped, not written", not forbidden, repr(forbidden))
+    check("and the escaped title still reads back as the original", json.loads(line.split(": ", 1)[1]) == nasty)
+    check("while an emoji and an accent stay as they were", "😀 é" in line)
+    stamp = "2026-06-01T08:11:12Z"
+    stamped = fm([("title", stamp), ("id", stamp), ("created", stamp), ("updated", stamp), ("messages", 3)])
+    check("only the date keys are bare: a title or id that looks like a timestamp is still a string",
+          f'title: "{stamp}"' in stamped and f'id: "{stamp}"' in stamped
+          and f"created: {stamp}" in stamped and f"updated: {stamp}" in stamped, str(stamped))
+    check("a time is labelled UTC only after being converted to it",
+          mod.ts("2026-06-01T10:11:12+02:00") == "2026-06-01 08:11 UTC"
+          and mod.ts("2026-06-01T08:11:12Z") == "2026-06-01 08:11 UTC")
 
     with tempfile.TemporaryDirectory() as tmpname:
         tmp = Path(tmpname)
@@ -176,6 +212,8 @@ def main():
               and json.loads(meta["project"]) == 'Garden: "plants" & herbs'
               and meta["created"] == "2026-05-01T08:00:00Z" and meta["updated"] == "2026-05-02T09:30:00Z"
               and meta["messages"] == "6", str(meta)[:300])
+        check("and how the project was matched, so a guess is not read as a fact",
+              json.loads(meta["project_match"]) == "exact", str(meta)[:300])
         check("the old bullet header is gone", "- **ID:**" not in text)
         check("the title is still the first heading", rest[1] == f"# {HOSTILE_TITLE}")
         quoted = [l for l in rest if l.startswith(">")]
@@ -212,7 +250,7 @@ def main():
         loose = only_md(tmp / "srch" / "unfiled")
         loose_meta, _ = split_front_matter(loose.read_text(encoding="utf-8"))
         check("an unfiled conversation has no project and falls back to Untitled",
-              "project" not in loose_meta and json.loads(loose_meta["title"]) == "Untitled" and loose.name == "Untitled.md",
+              "project" not in loose_meta and "project_match" not in loose_meta and json.loads(loose_meta["title"]) == "Untitled" and loose.name == "Untitled.md",
               str(loose_meta))
 
         print("\nWith --faithful as well")
