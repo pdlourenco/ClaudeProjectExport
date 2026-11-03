@@ -372,6 +372,10 @@ def main():
             ("artifacts/e2/versions/v1.html", "<p>no record</p>"),
             ("artifacts/e3/artifact.json", json.dumps(artifact_meta("e3", "Music Room", ["m1"], "m1"))),
             ("artifacts/e3/versions/m1.html", "<p>same title</p>"),
+            # Fields of the wrong type: nothing here may stop the run.
+            ("artifacts/e4/artifact.json", json.dumps({"active_version": ["x"], "updated_at": {"a": 1},
+                                                       "versions": [{"id": {"a": 1}}, "text", {"id": "w1", "title": 7}]})),
+            ("artifacts/e4/versions/w1.html", "<p>wrong types</p>"),
         ]})
         run = extract(weird, tmp / "weird_out", mapping)
         out = tmp / "weird_out" / "unfiled" / "account" / "artifacts"
@@ -385,6 +389,9 @@ def main():
         check("a current version that is not in the archive falls back to the newest, and says so",
               "g9" in gone and "not in the archive" in gone and read(out / "Gone Active" / "Gone Active.html") == "<p>g2</p>")
         check("an artifact with no artifact.json is still written", read(out / "e2" / "e2.html") == "<p>no record</p>")
+        check("fields of the wrong type are tolerated and the page still written",
+              read(out / "e4" / "e4.html") == "<p>wrong types</p>" and "_versions.md" in {p.name for p in (out / "e4").iterdir()},
+              str(sorted(p.name for p in out.iterdir())))
         check("two artifacts with one title both survive",
               read(out / "Music Room" / "Music Room.html") == "<p>current</p>"
               and read(out / "Music Room_1" / "Music Room.html") == "<p>same title</p>", str(sorted(p.name for p in out.iterdir())))

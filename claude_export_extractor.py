@@ -2585,14 +2585,16 @@ def _artifact_versions(files: dict) -> dict:
 
 
 def _listed_versions(meta: dict) -> list:
+    # An id is a string; anything else in its place is a record this tool cannot place.
     listed = meta.get("versions")
-    return [v for v in listed if isinstance(v, dict) and v.get("id")] if isinstance(listed, list) else []
+    return [v for v in listed if isinstance(v, dict) and isinstance(v.get("id"), str) and v["id"]] \
+        if isinstance(listed, list) else []
 
 
 def _active_version(meta: dict, versions: dict):
     """The version the artifact currently shows: the one it names, else the newest it has."""
     wanted = meta.get("active_version")
-    if wanted in versions:
+    if isinstance(wanted, str) and wanted in versions:
         return wanted
     present = [v for v in _listed_versions(meta) if v["id"] in versions]
     if present:
@@ -2734,9 +2736,9 @@ def write_artifacts(archive, groups: dict, destination: Path, faithful: bool, co
 
         versions = _artifact_versions(files)
         active = _active_version(meta, versions)
-        if meta.get("active_version") and meta["active_version"] not in versions:
-            notes.append(f"The version it names as current ({meta['active_version']}) is not in "
-                         f"the archive.")
+        named = meta.get("active_version")
+        if named and not (isinstance(named, str) and named in versions):
+            notes.append(f"The version it names as current ({named}) is not in the archive.")
         listed = {v["id"]: v for v in _listed_versions(meta)}
         title = (_as_text(listed.get(active, {}).get("title"))
                  or next((_as_text(v.get("title")) for v in listed.values() if _as_text(v.get("title"))), "")
