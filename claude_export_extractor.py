@@ -911,17 +911,44 @@ def _quote_block(text: str) -> list:
 
 _MARKDOWN_LEAD = re.compile(r"^\s*(?:#{1,6}\s+|>+\s*|[-*+]\s+|\d+[.)]\s+)+")
 _FENCE_OPEN = re.compile(r"(`{3,})[^`]*$|(~{3,})")
-_TAG = re.compile(r"<!--.*?-->|</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>")
+# A comment, or something shaped like an HTML tag; _strip_tag decides whether it is one.
+_TAG = re.compile(r"<!--.*?-->|</?([A-Za-z][A-Za-z0-9]*)(\s[^<>]*)?/?>", re.DOTALL)
+# The elements people actually type into a chat. A name outside this set, as in Vec<u8> or
+# List<T>, is text: stripping it would lose a word, and escaping its "<" is enough.
+_HTML_ELEMENTS = frozenset("""
+    a abbr b big blockquote br caption center cite code dd del details div dl dt em figcaption
+    figure font h1 h2 h3 h4 h5 h6 hr i img ins kbd li mark ol p pre q s samp small span strike
+    strong sub summary sup table tbody td tfoot th thead tr tt u ul var
+""".split())
+
+
+def _strip_tag(match) -> str:
+    """" " for a comment or a real tag; the text unchanged for a lookalike.
+
+    A real tag has a known element name, and any attributes carry an "=": that tells
+    <b class="x"> from the comparison in "a<b and c>d", which has the same shape.
+    """
+    name, attributes = match.group(1), match.group(2)
+    if name is None:
+        return " "
+    if name.lower() in _HTML_ELEMENTS and (not attributes or "=" in attributes):
+        return " "
+    return match.group(0)
 
 
 def _escape_heading(text: str) -> str:
     """Backslash the characters that would still do something inside a heading: a `#` that
     starts a word is an Obsidian tag (and a trailing one ends the heading), `$` opens maths,
-    `==` highlights, `%%` comments out, and `_` at the edge of a word is emphasis. The words
-    stay as they were; snake_case and C# are left alone."""
+    `==` highlights, `%%` comments out, `_` at the edge of a word is emphasis, and a `<`
+    before a letter, `/`, `!` or `?` could open HTML or an autolink. The words stay as they
+    were; snake_case, C#, "a < b" and "x<5" are left alone.
+
+    For `_`, an underscore does not count as part of a word: in __init__ the inner ones
+    border another `_`, and left alone they would make _init_ emphasis."""
     text = text.replace("$", "\\$").replace("==", "\\=\\=").replace("%%", "\\%\\%")
     text = re.sub(r"(?<!\S)#", r"\\#", text)
-    return re.sub(r"(?<!\w)_|_(?!\w)", r"\\_", text)
+    text = re.sub(r"<(?=[A-Za-z/!?])", r"\\<", text)
+    return re.sub(r"(?<![^\W_])_|_(?![^\W_])", r"\\_", text)
 
 
 def _heading_snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
@@ -946,8 +973,8 @@ def _heading_snippet(text: str, limit: int = SNIPPET_CHARS) -> str:
             continue
         line = _MARKDOWN_LEAD.sub("", line)
         line = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", line)   # [text](url) -> text
-        line = _TAG.sub(" ", line)                                # tags, not "a < b and c > d"
-        line = re.sub(r"[`*~\[\]<>|\\]", "", line)               # what would format or link
+        line = _TAG.sub(_strip_tag, line)                         # real tags, not "a<b and c>d"
+        line = re.sub(r"[`*~\[\]|\\]", "", line)                 # what would format or link
         line = " ".join(line.split())
         if not re.search(r"\w", line):
             continue

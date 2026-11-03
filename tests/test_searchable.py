@@ -146,10 +146,21 @@ def main():
           and snip("~~~\ncode\n~~~\nafter it") == "after it")
     check("an unclosed fence leaves nothing rather than the code", snip("```\nnever closed\nstill code") == "")
     check("comparisons and generics keep their words, only real tags are taken out",
-          snip("if a < b and c > d then fail") == "if a b and c d then fail"
-          and snip("x<5 or y>3") == "x5 or y3"
-          and snip("Map<String, Int> and <em>this</em> and <!-- hidden --> <br/> end") == "MapString, Int and this and end",
+          snip("if a < b and c > d then fail") == "if a < b and c > d then fail"
+          and snip("x<5 or y>3") == "x<5 or y>3"
+          and snip("Map<String, Int> and <em>this</em> and <!-- hidden --> <br/> end")
+          == "Map\\<String, Int> and this and end",
           snip("Map<String, Int> and <em>this</em> and <!-- hidden --> <br/> end"))
+    check("a tag-shaped comparison or generic is kept, with its '<' escaped",
+          snip("if a<b and c>d then") == "if a\\<b and c>d then"
+          and snip("Vec<u8> vs List<T>") == "Vec\\<u8> vs List\\<T>",
+          snip("Vec<u8> vs List<T>"))
+    check("a real tag with attributes, or in capitals, is still taken out",
+          snip('<b class="x">bold</b> text') == "bold text" and snip("<BR>Upper") == "Upper")
+    check("a dunder is escaped whole, so _init_ does not become emphasis",
+          snip("what does __init__ do") == "what does \\_\\_init\\_\\_ do"
+          and snip("a__b and snake_case_name") == "a\\_\\_b and snake_case_name",
+          snip("what does __init__ do"))
     check("a hash that would become a tag or end the heading is escaped, a C# is left alone",
           snip("#rust how do I borrow") == "\\#rust how do I borrow"
           and snip("What is C #") == "What is C \\#" and snip("Is C# any good") == "Is C# any good")

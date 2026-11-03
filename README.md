@@ -560,8 +560,9 @@ It writes each transcript for tools that index and filter, and keeps everything 
 - **A snippet in each message heading**, so hits in a long conversation can be told apart:
   `### HUMAN · 2026-06-01 08:11 UTC — I have a Mx master 3 mouse and a Mx master 3s keyboard…`.
   The snippet is the first line with words in it, outside code blocks, with markdown that would
-  format or link inside a heading removed and the characters Obsidian would act on (`#tag`,
-  `$maths$`, `==highlight==`) escaped, cut at a word at about 70 characters. A message with no
+  format or link inside a heading removed (HTML tags included) and the characters Obsidian would
+  act on (`#tag`, `$maths$`, `==highlight==`, `_emphasis_`, a `<` that could open HTML) escaped,
+  so `Vec<u8>` and `__init__` read as written, cut at a word at about 70 characters. A message with no
   text keeps a bare heading.
 
 Below the headings the transcript is identical to the one written without the flag. It combines
