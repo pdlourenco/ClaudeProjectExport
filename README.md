@@ -38,7 +38,9 @@ That's it. No `pip install`, no virtual environment, no config file.
 3. Click **Settings**
 4. Under the **Account** section, click **Export Data**
 5. Claude sends you an email with a download link (usually arrives within a few minutes)
-6. Download the ZIP file. What's inside depends on when the export was produced:
+6. Download what the email links to. Older exports are one ZIP; recent ones are several (one per
+   category, plus a manifest of download links). What's inside depends on when the export was
+   produced:
 
 | File | Contents |
 |------|----------|
@@ -47,6 +49,8 @@ That's it. No `pip install`, no virtual environment, no config file.
 | `projects.json` | Older exports instead ship a single file holding every project |
 | `memories.json`, or `memories/<uuid>.json` | Saved memories |
 | `reflections/<uuid>.json` | Monthly reflections on how you used Claude (newer exports; the export's manifest calls this category `feedback`), plus a `feedback` list |
+| `claude_code_cloud/routines.json`, `routine_runs.json` | Scheduled Claude Code routines and their runs |
+| `artifacts/<id>/…` | Your published Artifacts, every version of each (the archive is called `frames`) |
 | `users.json` | Account info |
 | `login_history.json` | Sign-in history (not used by this tool) |
 
@@ -54,11 +58,25 @@ Both project layouts are read, so it doesn't matter which one your export uses. 
 for a per-conversation `conversations/<uuid>.json` layout, should exports move that way as they
 already did for projects.
 
-Recent exports arrive as several archives that you may collate into one, nested under a folder
-such as `conversations-with-claude/unprocessed/`. That is read too. Entries are classified by
-their own filename and the directory holding them, never by matching the whole path — a folder
-whose name happens to contain "conversation" would otherwise make every file in the archive,
-project files included, look like the conversation list.
+### An export that comes as several ZIPs
+
+Give the tool what Claude.ai gave you. Name every ZIP, or name the folder they are in:
+
+```bash
+python claude_export_extractor.py ~/Downloads/claude-export/          # every .zip directly inside
+python claude_export_extractor.py conversations-000.zip projects-000.zip memories-000.zip
+```
+
+The entries of all the ZIPs are read as one export; nothing is unpacked or repacked first, and
+nothing is extracted to disk. A folder stands for the `.zip` files directly inside it — the
+download manifest and any other file there are ignored. When the folder holds a manifest, a ZIP
+it lists that is missing is a warning, since a missing ZIP is a missing category. The same entry
+in two ZIPs is kept once if the content is identical and is an error if it differs; the order
+the ZIPs are named in never decides which one wins. A single ZIP works as it always has, and so
+does one you assembled yourself, even nested under a folder. Entries are classified by their own
+filename and the directory holding them, never by matching the whole path — a folder whose name
+happens to contain "conversation" would otherwise make every file in the archive, project files
+included, look like the conversation list.
 
 ## Usage
 
@@ -168,7 +186,7 @@ _unfiled/
 ├── Weeknight dinner ideas.md
 ├── Quick API question.md
 ├── attachments/                # text extracted from attachments, if any
-└── account/                    # reflections and memory — see below
+└── account/                    # reflections, memory, routines, artifacts — see below
 ```
 
 ### Account-level documents
@@ -178,8 +196,8 @@ Each extracted project gets its own memory note, if Claude keeps one for it, as
 default: the rest of the account's memory covers every project, and a folder handed to Claude
 Code as context should not carry other projects' notes or a summary of all your conversations.
 
-The account-wide documents (reflections, the conversations summary, every project's note, and
-the memory files) are written once, under `account/`. With `--unfiled` they go into that
+The account-wide documents (reflections, the conversations summary, every project's note, the
+memory files, scheduled routines and published artifacts) are written once, under `account/`. With `--unfiled` they go into that
 directory, with or without `--faithful`. Without `--unfiled` they are written beside the first
 project only with `--faithful`, and a note on stderr says when they were left out.
 
@@ -201,6 +219,40 @@ These are recognised by what they contain, not by what the file is called — th
 already renamed one category. An account file the tool has no renderer for is named in a note on
 stderr rather than passed over; `--faithful` keeps it verbatim under `raw/account/`. `users.json`
 and `login_history.json` are identity and sign-in records and are only ever kept raw.
+
+#### Scheduled routines
+
+```
+account/routines/
+├── Weekly check.md             # schedule, state, the prompt, and the routine's runs
+├── _index.md                   # every routine: schedule, state, run count, last run
+└── _runs_without_routine.md    # only if some run belongs to a routine the export lacks
+```
+
+The export keeps routines and their runs in two files; they are joined on `routine_id`. A
+prompt the export withheld is said to be withheld. A record that is neither a routine nor a run
+is shown in `_unrecognised.md` rather than dropped.
+
+#### Published artifacts
+
+```
+account/artifacts/
+└── My Deck/                    # named after the artifact's title
+    ├── deck.json …             # the current version's content: the page for a plain artifact,
+    │                           # the files under project/ for a typed one (a deck, a design canvas)
+    └── _versions.md            # every version, which is current, and the conversations that mention it
+```
+
+A typed artifact ships the type's runtime with each version — several megabytes, identical in
+every version, and not your content — so the readable output leaves it out. The hashes the
+export records in each version's `.files.json` are checked against the files, and a mismatch or
+a missing file is a warning on stderr and a section of `_versions.md`; the run goes on.
+`--faithful` additionally copies every file of every version, byte for byte and at its own path,
+to `raw/artifacts/`. Identical files are not stored once there: Git stores identical content
+once anyway, and a folder that mirrors the source is easy to browse and to compare.
+
+A file the tool does not read at all — neither JSON nor part of an artifact — is named in a note
+on stderr, and `--faithful` copies it to `raw/other/`.
 
 ## How Conversation Matching Works
 
@@ -517,7 +569,9 @@ own summary, and the reply-threading ids.
 ├── thinking/        Weekly sync.md
 └── raw/
     ├── project.json
-    ├── account/     users.json, memories/…, reflections/…, login_history.json
+    ├── account/     users.json, memories/…, reflections/…, routines.json, login_history.json
+    ├── artifacts/   <id>/artifact.json, <id>/versions/…   # every version, byte for byte
+    ├── other/       files nothing here reads, if the export has any
     └── conversations/  Weekly sync.json     # the source record, untouched
 ```
 

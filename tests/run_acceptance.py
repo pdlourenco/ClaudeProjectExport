@@ -33,7 +33,8 @@ EXTRACTOR = ROOT / "claude_export_extractor.py"
 BASELINE_REFS = ("2a3d93947ac3593396b5624e427628257319b925",
                  "claude/fix-silent-data-loss-and-crashes", "main")
 
-STDLIB_ALLOWED = {"zipfile", "json", "re", "sys", "argparse", "pathlib", "datetime", "collections"}
+STDLIB_ALLOWED = {"zipfile", "json", "re", "sys", "argparse", "pathlib", "datetime", "collections",
+                  "contextlib", "hashlib", "shutil", "zlib"}
 
 results = []
 
