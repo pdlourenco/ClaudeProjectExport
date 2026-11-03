@@ -2720,16 +2720,27 @@ def _verify_version(archive, files: dict, version: str, manifest) -> tuple:
     return verified, problems
 
 
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+
+
 def _artifact_mentions(conversations, ids) -> dict:
-    """artifact id -> the conversations whose record contains it."""
+    """artifact id -> the conversations whose record contains it.
+
+    Artifact ids are UUIDs, so each conversation is scanned once for UUID-shaped tokens and
+    those are looked up in a set: the cost does not grow with the number of artifacts. (A
+    regex alternation of the ids would still try every id at every position.) An id that is
+    not UUID-shaped is searched for directly, so none is ever missed.
+    """
     mentions = {artifact_id: [] for artifact_id in ids}
+    by_key = {i.lower(): i for i in mentions if _UUID.fullmatch(i)}
+    others = [i for i in mentions if not _UUID.fullmatch(i)]
     if not mentions:
         return mentions
-    # One alternation, longest first, so each conversation is scanned once however many
-    # artifacts there are.
-    pattern = re.compile("|".join(re.escape(i) for i in sorted(mentions, key=len, reverse=True)))
     for conv in conversations:
-        for artifact_id in set(pattern.findall(json.dumps(conv, ensure_ascii=False))):
+        text = json.dumps(conv, ensure_ascii=False)
+        found = {by_key[key] for key in {m.lower() for m in _UUID.findall(text)} if key in by_key}
+        found.update(i for i in others if i in text)
+        for artifact_id in found:
             mentions[artifact_id].append(conv)
     return mentions
 
