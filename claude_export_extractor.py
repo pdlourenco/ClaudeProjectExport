@@ -29,8 +29,15 @@ Examples:
 
     # Also save the conversations that belong to no project at all
     python claude_export_extractor.py export.zip --mapping mapping.json --unfiled ./_unfiled
+
+    # An export delivered as several zips: name them all, or the folder that holds them
+    python claude_export_extractor.py conversations-000.zip projects-000.zip memories-000.zip
+    python claude_export_extractor.py ~/Downloads/claude-export/ --mapping mapping.json
 """
 
+import contextlib
+import hashlib
+import shutil
 import zipfile
 import json
 import re
@@ -184,13 +191,19 @@ def _extended(path) -> Path:
 # ── Data loading ──────────────────────────────────────────────────────────────
 
 def classify_entry(name: str) -> str:
-    """Say what an archive entry is: "project", "conversation", "account", or "" for neither.
+    """Say what an archive entry is: "project", "conversation", "account", "artifact", or ""
+    for none of them.
 
     Judged on the file's own name and the directory holding it, never on the whole path.
     Substring-matching the path reads as harmless until an export nests everything under a
     folder called conversations-with-claude, at which point every entry in the archive —
     project files included — matches "conversation" and the classification collapses.
     """
+    # A published artifact is claimed first, whatever its files are called. A typed
+    # artifact carries the user's own project/ folder, and a file in it named
+    # conversations.json or project.json would otherwise be read as an export record.
+    if _artifact_parts(name):
+        return "artifact"
     lowered = name.lower()
     if not lowered.endswith(".json"):
         return ""
@@ -207,30 +220,170 @@ def classify_entry(name: str) -> str:
     return "account"
 
 
-def load_export(zip_path: Path):
-    """Load projects and conversations from the export ZIP.
+class ExportError(Exception):
+    """The export cannot be read as delivered: no zips to read, or two zips that disagree."""
+
+
+def expand_sources(sources) -> list:
+    """The zip files named by `sources`: a path, or a list of them, each a zip or a folder.
+
+    A folder stands for every .zip directly inside it, in name order. Anything else in it —
+    the download manifest, a mapping file, notes — is not an archive and is left alone.
+    """
+    if isinstance(sources, (str, Path)):
+        sources = [sources]
+    zips = []
+    for source in sources:
+        source = Path(source)
+        if source.is_dir():
+            found = sorted((p for p in source.iterdir() if p.is_file() and p.suffix.lower() == ".zip"),
+                           key=lambda p: p.name.lower())
+            if not found:
+                raise ExportError(f"No .zip files in {source}")
+            zips.extend(found)
+        elif source.exists():
+            zips.append(source)
+        else:
+            raise FileNotFoundError(str(source))
+    return zips
+
+
+class ExportArchive:
+    """An export as claude.ai delivers it: one or more zips whose entries are read as one.
+
+    A large export arrives as a zip per category — conversations, projects, memories and so
+    on, split into parts when a category is big — and each zip holds its entries under the
+    paths they belong at. The union of the entries is the export, so there is nothing to
+    unpack or repack first. Entries are read from the zips in memory and never extracted.
+
+    The same entry name in two zips is fine when the bytes are the same, and kept once. When
+    they differ it is an error: letting the order the zips were given in pick the survivor
+    would make the result depend on something that is not in the data.
+    """
+
+    def __init__(self, paths):
+        self.paths = [Path(p) for p in paths]
+        self._zips = []
+        self._where = {}
+        try:
+            for path in self.paths:
+                try:
+                    zf = zipfile.ZipFile(path, "r")
+                except zipfile.BadZipFile:
+                    raise zipfile.BadZipFile(str(path)) from None
+                self._zips.append(zf)
+                for info in zf.infolist():
+                    if not info.is_dir():
+                        self._add(path, zf, info)
+        except BaseException:
+            self.close()
+            raise
+
+    def _add(self, path, zf, info):
+        seen = self._where.get(info.filename)
+        if seen is None:
+            self._where[info.filename] = (path, zf, info)
+            return
+        first_path, first_zf, first_info = seen
+        if (first_info.file_size, first_info.CRC) != (info.file_size, info.CRC) \
+                or first_zf.read(first_info) != zf.read(info):
+            raise ExportError(f"{info.filename} is in both {first_path.name} and {path.name}, "
+                              f"with different content")
+
+    def names(self) -> list:
+        return sorted(self._where)
+
+    def read(self, name: str) -> bytes:
+        _, zf, info = self._where[name]
+        return zf.read(info)
+
+    def open(self, name: str):
+        """The entry as a stream, for the ones too big to hold in memory twice."""
+        _, zf, info = self._where[name]
+        return zf.open(info)
+
+    def close(self):
+        for zf in self._zips:
+            zf.close()
+        self._zips = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+@contextlib.contextmanager
+def _opened(source):
+    """An ExportArchive for `source`: a zip, a folder of zips, a list of them, or one already open."""
+    if isinstance(source, ExportArchive):
+        yield source
+        return
+    with ExportArchive(expand_sources(source)) as archive:
+        yield archive
+
+
+def manifest_warnings(sources, zips) -> list:
+    """Say which archives a folder's download manifest lists that are not there.
+
+    The manifest has no hashes, so completeness is all it can vouch for — but a missing zip
+    is a missing category (no projects, no memory), and nothing else would say so. Only a
+    folder is checked: a zip named on its own is a deliberate choice of what to read.
+    """
+    present = {Path(z).name.lower() for z in zips}
+    warnings = []
+    for source in sources:
+        source = Path(source)
+        if not source.is_dir():
+            continue
+        newest = None
+        for path in sorted(source.glob("manifest-*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                listed = [f["filename"] for f in data["data_files"]
+                          if isinstance(f, dict) and isinstance(f.get("filename"), str)]
+                stamp = str(data.get("created_at") or "")
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if newest is None or stamp > newest[0]:
+                newest = (stamp, path, listed)
+        if newest:
+            _, path, listed = newest
+            missing = sorted(name for name in listed if name.lower() not in present)
+            if missing:
+                warnings.append(f"{path.name} lists {len(listed)} archives but {', '.join(missing)} "
+                                f"{'is' if len(missing) == 1 else 'are'} not in {source}; "
+                                f"what they hold is missing from this run.")
+    return warnings
+
+
+def load_export(source):
+    """Load projects and conversations from the export.
+
+    `source` is a zip, a folder of zips, a list of either, or an open ExportArchive.
 
     Exports come in two layouts. Older ones ship a single projects.json holding every
     project. Current ones ship one file per project, under projects/<uuid>.json. Reading
     only the first file whose name matches drops every project but one — silently, since
     a one-project export is perfectly plausible — so every match is read and merged.
     """
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        names = zf.namelist()
+    with _opened(source) as archive:
+        names = archive.names()
 
         proj_files = sorted(n for n in names if classify_entry(n) == "project")
         conv_files = sorted(n for n in names if classify_entry(n) == "conversation")
 
         projects = []
         for proj_file in proj_files:
-            projects.extend(_as_projects(json.loads(zf.read(proj_file))))
+            projects.extend(_as_projects(json.loads(archive.read(proj_file))))
 
         # Every conversation file, for the same reason every project file is read: taking
         # the first match is how a per-file layout silently yields one record. Exports have
         # already moved projects that way once.
         conversations = []
         for conv_file in conv_files:
-            conversations.extend(_as_conversations(json.loads(zf.read(conv_file))))
+            conversations.extend(_as_conversations(json.loads(archive.read(conv_file))))
 
     return _dedup_by_uuid(projects), _dedup_by_uuid(conversations)
 
@@ -261,7 +414,7 @@ def _as_conversations(blob):
     return []
 
 
-def load_account_files(zip_path: Path) -> dict:
+def load_account_files(source) -> dict:
     """Return the archive's JSON files that this tool never reads, name -> bytes.
 
     users.json, memories.json and login_history.json are account-level rather than project
@@ -270,8 +423,8 @@ def load_account_files(zip_path: Path) -> dict:
     mattering: whatever is not a project or conversation file is carried across untouched.
     """
     out = {}
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        entries = sorted(name for name in zf.namelist()
+    with _opened(source) as archive:
+        entries = sorted(name for name in archive.names()
                          if classify_entry(name) == "account" and _path_segments(name))
         # Two account files can share a base name in different folders. Keying on the base
         # name alone collapses them into one and lets the archive's entry order pick the
@@ -288,7 +441,7 @@ def load_account_files(zip_path: Path) -> dict:
                 key = "/".join(parts[-2:])
             while key in out:
                 key = "/".join(parts)
-            out[key] = zf.read(name)
+            out[key] = archive.read(name)
     return out
 
 
@@ -296,6 +449,20 @@ def _path_segments(name: str) -> list:
     """A path's segments, with "." and ".." dropped so a key can never climb out."""
     return [part for part in str(name).replace("\\", "/").split("/")
             if part and part not in (".", "..")]
+
+
+def _artifact_parts(name: str):
+    """(artifact id, path inside the artifact) for an entry in a published-artifact tree, else None.
+
+    The tree is artifacts/<id>/artifact.json beside artifacts/<id>/versions/…, possibly
+    under a folder the archive nests everything in. Both halves are required, so a folder
+    that merely happens to be called "artifacts" is not mistaken for one.
+    """
+    parts = _path_segments(name)
+    for i in range(len(parts) - 2):
+        if parts[i].lower() == "artifacts" and parts[i + 2].lower() in ("artifact.json", "versions"):
+            return parts[i + 1], tuple(parts[i + 2:])
+    return None
 
 
 def _as_projects(blob):
@@ -1592,9 +1759,14 @@ def interactive_mode(index, show_strategy: bool = False, include_thinking: bool 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract specific projects from a Claude.ai data export ZIP."
+        description="Extract specific projects from a Claude.ai data export."
     )
-    parser.add_argument("zip_path", help="Path to the Claude.ai export ZIP file")
+    parser.add_argument("export", nargs="+", metavar="EXPORT",
+                        help="The export as Claude.ai delivers it: a ZIP file, several ZIP files "
+                             "(one per category), or a folder holding them. A folder stands for "
+                             "every .zip directly inside it; anything else there, such as the "
+                             "download manifest, is ignored. The zips' entries are read as one "
+                             "export, and nothing is extracted to disk.")
     parser.add_argument("--json", action="store_true",
                         help="Print project list as JSON (for automation)")
     parser.add_argument("--extract", type=str, default=None,
@@ -1632,11 +1804,18 @@ def main():
             stream.reconfigure(errors="backslashreplace")
 
     args = parser.parse_args()
-    zip_path = Path(args.zip_path)
+    sources = [Path(p) for p in args.export]
 
-    if not zip_path.exists():
-        print(f"ERROR: File not found: {zip_path}", file=sys.stderr)
+    for source in sources:
+        if not source.exists():
+            print(f"ERROR: File not found: {source}", file=sys.stderr)
+            sys.exit(1)
+    try:
+        zips = expand_sources(sources)
+    except ExportError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
+    label = str(zips[0]) if len(zips) == 1 else         f"{len(zips)} archives ({', '.join(z.name for z in zips)})"
 
     if args.unfiled and not args.mapping:
         print("ERROR: --unfiled requires --mapping — without an exact join there is no way to "
@@ -1655,20 +1834,26 @@ def main():
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
 
-    print(f"Loading: {zip_path}", file=sys.stderr if args.json else sys.stdout)
+    print(f"Loading: {label}", file=sys.stderr if args.json else sys.stdout)
+    for warning in manifest_warnings(sources, zips):
+        print(f"WARNING: {warning}", file=sys.stderr)
     try:
-        projects, conversations = load_export(zip_path)
-    except zipfile.BadZipFile:
-        print(f"ERROR: Not a ZIP file (or the download is corrupt): {zip_path}", file=sys.stderr)
+        archive = ExportArchive(zips)
+        projects, conversations = load_export(archive)
+    except zipfile.BadZipFile as exc:
+        print(f"ERROR: Not a ZIP file (or the download is corrupt): {exc}", file=sys.stderr)
+        sys.exit(1)
+    except ExportError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
     except json.JSONDecodeError as exc:
-        print(f"ERROR: The export contains invalid JSON ({zip_path}): {exc}", file=sys.stderr)
+        print(f"ERROR: The export contains invalid JSON ({label}): {exc}", file=sys.stderr)
         sys.exit(1)
     except RecursionError:
-        print(f"ERROR: The export's JSON is nested too deeply to parse: {zip_path}", file=sys.stderr)
+        print(f"ERROR: The export's JSON is nested too deeply to parse: {label}", file=sys.stderr)
         sys.exit(1)
     except OSError as exc:
-        print(f"ERROR: Could not read {zip_path}: {exc}", file=sys.stderr)
+        print(f"ERROR: Could not read {label}: {exc}", file=sys.stderr)
         sys.exit(1)
 
     if mapping:
@@ -1701,7 +1886,7 @@ def main():
 
     # Each project carries its own memory note into its folder. The account files are read
     # here, once, for that and for the account-level output written later.
-    account = load_account_files(zip_path)
+    account = load_account_files(archive)
     memories = project_memories_by_uuid(account)
     for entry in index:
         entry["memory"] = memories.get(entry["uuid"], "")
@@ -1755,7 +1940,8 @@ def main():
         # resolved default included. Account files are not project data, so one copy.
         account_home = Path(args.unfiled) if args.unfiled else plan[0][1]
         write_account_output(account, account_home, project_names, args.faithful,
-                             in_project=not args.unfiled)
+                             in_project=not args.unfiled, archive=archive,
+                             conversations=conversations)
 
         for entry, out_dir in plan:
             print(f"\nExtracting: {entry['name']} -> {out_dir}")
@@ -1774,15 +1960,19 @@ def main():
     if chosen:
         account_home = Path(args.unfiled) if args.unfiled else chosen
         write_account_output(account, account_home, project_names, args.faithful,
-                             in_project=not args.unfiled)
+                             in_project=not args.unfiled, archive=archive,
+                             conversations=conversations)
         _extract_unfiled(args.unfiled, unfiled, args.thinking or args.faithful, args.faithful)
         print("\nDone!")
 
 
 def write_account_output(account: dict, destination: Path, project_names, faithful: bool,
-                         in_project: bool = False):
+                         in_project: bool = False, archive=None, conversations=()):
     """Write everything account-level into destination: the rendered documents, and under
     --faithful the raw files too.
+
+    `archive` is the open export, for what is too big to have been loaded up front: the
+    published artifacts, and any file this tool does not read at all.
 
     When destination is a project's own folder, nothing is written unless --faithful asks
     for everything. The account's memory covers every project, and a project folder is
@@ -1790,17 +1980,27 @@ def write_account_output(account: dict, destination: Path, project_names, faithf
     is not something a plain --extract should do unasked. Each project still gets its own
     note, written by extract_project.
     """
+    artifacts = group_artifacts(archive) if archive is not None else {}
+    unread = unread_entries(archive) if archive is not None else []
     if in_project and not faithful:
-        if any(Path(name).name not in RAW_ONLY_ACCOUNT_FILES for name in account):
-            print("\nNOTE: account-wide memory and reflections were not written; each project's "
-                  "own memory note is in its project_knowledge/_project_memory.md. Pass "
-                  "--unfiled DIR to write the rest there, or --faithful to write it beside the "
-                  "first project.", file=sys.stderr)
+        held_back = [name for name in account if Path(name).name not in RAW_ONLY_ACCOUNT_FILES]
+        held_back += ["artifacts"] if artifacts else []
+        if held_back:
+            print("\nNOTE: account-wide documents (memory, reflections, routines, artifacts) were "
+                  "not written; each project's own memory note is in its "
+                  "project_knowledge/_project_memory.md. Pass --unfiled DIR to write the rest "
+                  "there, or --faithful to write it beside the first project.", file=sys.stderr)
+        _note_unread(unread, faithful)
         return
     try:
         if faithful:
             copy_account_files(account, destination)
         write_account_documents(account, destination, project_names, faithful)
+        if artifacts:
+            write_artifacts(archive, artifacts, destination, faithful, conversations)
+        _note_unread(unread, faithful)
+        if faithful and unread:
+            copy_unread_entries(archive, unread, destination)
     except OSError as exc:
         # Account files are not project data, so failing to write them is reported and the
         # projects are still extracted, rather than ending the run before any project is.
@@ -1949,6 +2149,68 @@ def _table_cell(text: str) -> str:
     return " ".join(text.replace("|", "\\|").split())
 
 
+# Names the routines folder already uses for its own files.
+RESERVED_ROUTINE_FILES = ("_index.md", "_runs_without_routine.md", "_unrecognised.md")
+
+
+def _run_time(run) -> str:
+    return str(run.get("scheduled_for") or run.get("started_at") or "")
+
+
+def _routine_schedule(routine) -> str:
+    schedule = routine.get("schedule")
+    if not isinstance(schedule, dict):
+        return _as_text(schedule) if isinstance(schedule, str) else ""
+    if schedule.get("cron"):
+        return f"cron `{schedule['cron']}`"
+    if schedule.get("run_once_at"):
+        return f"once, at {ts(str(schedule['run_once_at']))}"
+    return ""
+
+
+def _routine_state(routine) -> str:
+    state = ("enabled" if routine.get("enabled") is True
+             else "disabled" if routine.get("enabled") is False else "")
+    if routine.get("ended_at"):
+        state = (state + ", " if state else "") + f"ended {ts(str(routine['ended_at']))}"
+    return state
+
+
+def _runs_table(runs, with_routine: bool = False) -> list:
+    head = ["Scheduled", "Started", "Finished", "Status", "Session"]
+    head = ["Routine", *head] if with_routine else head
+    lines = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    for run in runs:
+        cells = [ts(str(run.get(k) or "")) for k in ("scheduled_for", "started_at", "finished_at")]
+        cells += [str(run.get("status") or ""), str(run.get("session_id") or "")]
+        if with_routine:
+            cells.insert(0, str(run.get("routine_id") or ""))
+        lines.append("| " + " | ".join(_table_cell(c) for c in cells) + " |")
+    return lines
+
+
+def render_routine(routine, runs) -> str:
+    """One scheduled routine as markdown, with its runs. Tolerates any field being absent."""
+    name = _as_text(routine.get("name")) or str(routine.get("routine_id") or "Routine")
+    lines = [f"# {name}\n"]
+    meta = [("Routine", routine.get("routine_id")), ("Agent", routine.get("agent_id")),
+            ("State", _routine_state(routine)), ("Schedule", _routine_schedule(routine)),
+            ("Created", ts(str(routine["created_at"])) if routine.get("created_at") else ""),
+            ("Updated", ts(str(routine["updated_at"])) if routine.get("updated_at") else "")]
+    lines.extend(f"- **{label}:** {value}" for label, value in meta if value)
+    lines.extend(["", "## Prompt", ""])
+    prompt = routine.get("prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        lines.extend(_fence(prompt.strip()))
+    elif not routine.get("prompt_withheld"):
+        lines.append("_No prompt._")
+    if routine.get("prompt_withheld"):
+        lines.extend(["", "_The export withheld this routine's prompt._"])
+    lines.extend(["", f"## Runs ({len(runs)})", ""])
+    lines.extend(_runs_table(runs) if runs else ["_None in this export._"])
+    return "\n".join(lines) + "\n"
+
+
 class _AccountDocuments:
     """Writes the account documents of every account file into one account/ directory.
 
@@ -1964,9 +2226,10 @@ class _AccountDocuments:
         self.root = root
         self.project_names = project_names
         self.counts = {"reflections": 0, "feedback": 0, "summary": 0,
-                       "project_memories": 0, "memory_files": 0}
+                       "project_memories": 0, "memory_files": 0, "routines": 0, "routine_runs": 0}
         self.allocators = {}
         self.feedback, self.summaries, self.index, self.memory_files = [], [], [], []
+        self.routines, self.runs, self.cloud_other = [], [], []
         self.unnamed = 0
 
     def allocate(self, folder: Path, filename: str, reserved=()) -> Path:
@@ -2021,6 +2284,60 @@ class _AccountDocuments:
             self.memory_files.extend(r for r in files
                                      if isinstance(r, dict) and isinstance(r.get("content"), str))
 
+    def add_routines(self, blob):
+        """The scheduled routines and their runs, which the export keeps in separate files.
+
+        routines.json and routine_runs.json both hold a claude_code_cloud list, so a record
+        is told apart by what it carries, and the two are joined on routine_id in finish().
+        """
+        items = blob.get("claude_code_cloud")
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                self.cloud_other.append(item)
+            elif "scheduled_for" in item or "session_id" in item:
+                self.runs.append(item)
+            elif any(k in item for k in ("name", "prompt", "schedule", "enabled")):
+                self.routines.append(item)
+            else:
+                self.cloud_other.append(item)
+
+    def _write_routines(self):
+        directory = self.root / "routines"
+        runs = defaultdict(list)
+        for run in self.runs:
+            runs[str(run.get("routine_id"))].append(run)
+        known = {str(r.get("routine_id")) for r in self.routines}
+        rows = []
+        for routine in sorted(self.routines, key=lambda r: (_as_text(r.get("name")), str(r.get("routine_id")))):
+            own = sorted(runs.get(str(routine.get("routine_id")), []), key=_run_time)
+            name = _as_text(routine.get("name")) or str(routine.get("routine_id") or "routine")
+            self.allocate(directory, safe_name(name) + ".md", reserved=RESERVED_ROUTINE_FILES).write_text(
+                render_routine(routine, own), encoding="utf-8", errors="backslashreplace")
+            self.counts["routines"] += 1
+            self.counts["routine_runs"] += len(own)
+            rows.append((name, _routine_schedule(routine), _routine_state(routine), len(own),
+                         ts(str(own[-1].get("scheduled_for") or "")) if own else ""))
+        orphans = [run for run in self.runs if str(run.get("routine_id")) not in known]
+        if orphans:
+            self.counts["routine_runs"] += len(orphans)
+            lines = ["# Runs of routines that are not in this export\n",
+                     *_runs_table(sorted(orphans, key=_run_time), with_routine=True)]
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "_runs_without_routine.md").write_text(
+                "\n".join(lines) + "\n", encoding="utf-8", errors="backslashreplace")
+        if self.cloud_other:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / "_unrecognised.md").write_text(
+                "# Records in claude_code_cloud/ that are neither a routine nor a run\n\n"
+                + "\n".join(_fence(json.dumps(self.cloud_other, indent=2, ensure_ascii=False), "json"))
+                + "\n", encoding="utf-8", errors="backslashreplace")
+        if rows:
+            table = ["# Routines\n", "| Routine | Schedule | State | Runs | Last scheduled |",
+                     "|---|---|---|---|---|"]
+            table += ["| " + " | ".join(_table_cell(str(c)) for c in row) + " |" for row in rows]
+            (directory / "_index.md").write_text("\n".join(table) + "\n", encoding="utf-8",
+                                                errors="backslashreplace")
+
     def _write_memory_files(self):
         documents = self.root / "memory" / "documents"
         placed = []
@@ -2059,6 +2376,7 @@ class _AccountDocuments:
     def finish(self):
         """Write the files that collect something from every account file."""
         self._write_memory_files()
+        self._write_routines()
         if self.feedback:
             # Nothing is known of this list's shape beyond it being a list, so it is shown as
             # what it is rather than rendered as something it might not be.
@@ -2152,6 +2470,9 @@ def write_account_documents(account: dict, destination: Path, project_names=None
             if any(k in record for k in ("conversations_memory", "project_memories", "memory_files")):
                 recognised = True
                 documents.add_memory(record)
+            if isinstance(record.get("claude_code_cloud"), list):
+                recognised = True
+                documents.add_routines(record)
         if not recognised:
             unrendered.append(name)
     documents.finish()
@@ -2165,6 +2486,317 @@ def write_account_documents(account: dict, destination: Path, project_names=None
                 else "Pass --faithful to keep them verbatim under raw/account/.")
         print(f"\nNOTE: no readable rendering for account file(s): {', '.join(sorted(unrendered))}. "
               f"{kept}", file=sys.stderr)
+    return totals
+
+
+# ── Published artifacts and files nothing reads ───────────────────────────────
+
+def group_artifacts(archive) -> dict:
+    """artifact id -> {path inside the artifact, as a tuple of segments: archive entry name}."""
+    groups = {}
+    for name in archive.names():
+        found = _artifact_parts(name)
+        if found:
+            groups.setdefault(found[0], {})[found[1]] = name
+    return groups
+
+
+def unread_entries(archive) -> list:
+    """Entries that are neither JSON records nor part of an artifact: nothing here reads them.
+
+    There are none in an export seen so far. Listing them is how the next new kind of file
+    shows up as a line in the output rather than as a hole discovered months later.
+    """
+    return [name for name in archive.names() if not classify_entry(name) and _path_segments(name)]
+
+
+def _note_unread(unread, faithful: bool):
+    if not unread:
+        return
+    shown = ", ".join(unread[:5]) + (f" and {len(unread) - 5} more" if len(unread) > 5 else "")
+    kept = ("They are copied verbatim under raw/other/." if faithful
+            else "Pass --faithful to copy them verbatim under raw/other/.")
+    print(f"\nNOTE: {len(unread)} file(s) in the export are not read by this tool: {shown}. {kept}",
+          file=sys.stderr)
+
+
+def _copy_entries(archive, items, target: Path) -> int:
+    """Write archive entries verbatim under `target`; `items` is [(entry name, path segments)].
+
+    The segments came from an archive, which is not a trustworthy source of file paths, so
+    each is sanitized on the way out. Two entries that sanitize to the same path (case
+    aside) are both kept, the later one as name_1.ext, rather than one overwriting the other.
+    """
+    taken = set()
+    count = 0
+    for name, segments in items:
+        parts = [safe_name(part, 200) for part in segments]
+        stem, dot, ext = parts[-1].rpartition(".")
+        counter = 0
+        while True:
+            last = parts[-1] if not counter else (f"{stem}_{counter}.{ext}" if dot else f"{parts[-1]}_{counter}")
+            key = "/".join([*parts[:-1], last]).casefold()
+            if key not in taken:
+                break
+            counter += 1
+        taken.add(key)
+        out_path = target.joinpath(*parts[:-1], last)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        _copy_one(archive, name, out_path)
+        count += 1
+    return count
+
+
+def _copy_one(archive, name: str, out_path: Path):
+    with archive.open(name) as src, open(out_path, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+
+
+def copy_unread_entries(archive, names, destination: Path):
+    """Under --faithful, carry across the files no renderer exists for."""
+    count = _copy_entries(archive, [(n, _path_segments(n)) for n in names],
+                          _extended(destination) / "raw" / "other")
+    print(f"\nOther files -> {Path(destination) / 'raw' / 'other'}\n  {count} files")
+
+
+def _artifact_versions(files: dict) -> dict:
+    """The versions an artifact's files make up, version id -> where each piece is.
+
+    A plain artifact has one file per version (versions/<id>.html). A typed one — a deck, a
+    design canvas — has a folder per version (versions/<id>/…) and a manifest beside it
+    (versions/<id>.files.json) listing the files with their hashes.
+    """
+    versions = {}
+
+    def slot(version):
+        return versions.setdefault(version, {"page": None, "tree": {}, "manifest": None})
+
+    for inner in files:
+        if len(inner) < 2 or inner[0].lower() != "versions":
+            continue
+        head, rest = inner[1], inner[2:]
+        if rest:
+            slot(head)["tree"][rest] = inner
+        elif head.lower().endswith(".files.json"):
+            slot(head[:-len(".files.json")])["manifest"] = inner
+        else:
+            slot(head.rsplit(".", 1)[0] if "." in head else head)["page"] = inner
+    return versions
+
+
+def _listed_versions(meta: dict) -> list:
+    listed = meta.get("versions")
+    return [v for v in listed if isinstance(v, dict) and v.get("id")] if isinstance(listed, list) else []
+
+
+def _active_version(meta: dict, versions: dict):
+    """The version the artifact currently shows: the one it names, else the newest it has."""
+    wanted = meta.get("active_version")
+    if wanted in versions:
+        return wanted
+    present = [v for v in _listed_versions(meta) if v["id"] in versions]
+    if present:
+        return max(present, key=lambda v: str(v.get("created_at") or ""))["id"]
+    return max(versions) if versions else None
+
+
+def _verify_version(archive, files: dict, version: str, manifest) -> tuple:
+    """(files checked, problems) for one typed version against the hashes its manifest records."""
+    try:
+        data = json.loads(archive.read(files[manifest]))
+    except ValueError:
+        return 0, ["its files manifest is not valid JSON"]
+    entries = data.get("files") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return 0, ["its files manifest has no file list"]
+    checked, problems = 0, []
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("exported_as") or not entry.get("sha256"):
+            continue
+        name = files.get((manifest[0], version, *_path_segments(entry["exported_as"])))
+        if name is None:
+            problems.append(f"{entry['exported_as']} is in the manifest but not in the archive")
+            continue
+        digest = hashlib.sha256()
+        with archive.open(name) as stream:
+            for chunk in iter(lambda: stream.read(1 << 20), b""):
+                digest.update(chunk)
+        checked += 1
+        if digest.hexdigest() != str(entry["sha256"]).strip().lower():
+            problems.append(f"{entry['exported_as']} does not match the sha256 recorded for it")
+    return checked, problems
+
+
+def _artifact_mentions(conversations, ids) -> dict:
+    """artifact id -> the conversations whose record contains it."""
+    mentions = {artifact_id: [] for artifact_id in ids}
+    for conv in conversations:
+        text = json.dumps(conv, ensure_ascii=False)
+        for artifact_id in ids:
+            if artifact_id in text:
+                mentions[artifact_id].append(conv)
+    return mentions
+
+
+def _render_artifact_index(artifact_id, meta, title, versions, active, checks, mentions,
+                           notes, wrote_project, faithful) -> str:
+    listed = {v["id"]: v for v in _listed_versions(meta)}
+    lines = [f"# {title}\n", f"- **Artifact:** {artifact_id}"]
+    if meta.get("visibility"):
+        lines.append(f"- **Visibility:** {meta['visibility']}")
+    if meta.get("updated_at"):
+        lines.append(f"- **Updated:** {ts(str(meta['updated_at']))}")
+    lines.append(f"- **Current version:** {active or '(none in the archive)'}")
+    lines.extend(f"- **Note:** {note}" for note in notes)
+    lines.append("")
+
+    lines.extend(["## Versions", "", "| Version | Created | Title | Description | Content | Checked |",
+                  "|---|---|---|---|---|---|"])
+    ids = sorted(set(listed) | set(versions),
+                 key=lambda v: (str(listed.get(v, {}).get("created_at") or ""), v), reverse=True)
+    for version in ids:
+        info, slot = listed.get(version, {}), versions.get(version)
+        if slot is None:
+            content = "not in the archive"
+        elif slot["page"]:
+            content = "single page"
+        else:
+            project = sum(1 for rest in slot["tree"] if rest[0].lower() == "project")
+            content = f"{project} project files + the type's runtime" if slot["tree"] else "manifest only"
+        checked, problems = checks.get(version, (0, []))
+        status = (f"{len(problems)} failed" if problems else f"{checked} files" if checked else "")
+        mark = " **(current)**" if version == active else ""
+        lines.append("| " + " | ".join(_table_cell(str(c)) for c in (
+            f"{version}{mark}", ts(str(info.get("created_at") or "")), info.get("title") or "",
+            info.get("description") or "", content, status)) + " |")
+    lines.append("")
+
+    failed = [(v, p) for v, (_, probs) in checks.items() for p in probs]
+    if failed:
+        lines.extend(["## Files that failed verification", ""])
+        lines.extend(f"- {v}: {p}" for v, p in failed[:50])
+        if len(failed) > 50:
+            lines.append(f"- … and {len(failed) - 50} more")
+        lines.append("")
+
+    if mentions:
+        lines.extend(["## Mentioned in", ""])
+        for conv in mentions[:25]:
+            when = ts_short(conv.get("created_at") or "")
+            lines.append(f"- {_as_text(conv.get('name')) or '(untitled)'}"
+                         f"{f' ({when})' if when else ''} — {conv.get('uuid', '')}")
+        if len(mentions) > 25:
+            lines.append(f"- … and {len(mentions) - 25} more")
+        lines.append("")
+
+    lines.append("The current version's content is in this folder." if wrote_project
+                 else "No content could be written for the current version.")
+    lines.append("Every version is kept byte for byte under raw/artifacts/." if faithful
+                 else "Only the current version is written; pass --faithful to keep every version, "
+                      "byte for byte, under raw/artifacts/.")
+    return "\n".join(lines) + "\n"
+
+
+def write_artifacts(archive, groups: dict, destination: Path, faithful: bool, conversations=()) -> dict:
+    """Write each published artifact to account/artifacts/<title>/, and verify its files.
+
+    The readable output is the artifact's current version: the page itself for a plain
+    artifact, the files under project/ for a typed one. A typed version also ships the
+    type's runtime, several megabytes repeated unchanged in every version, which is left
+    out; it is not the artifact's own content. A _versions.md lists every version.
+
+    Under --faithful every file of every version is also copied, verbatim and at its own
+    path, to raw/artifacts/. Identical files are not stored once: git stores identical
+    content once anyway, and a folder of unchanged paths stays easy to browse and to compare
+    with the source.
+    """
+    shown = Path(destination) / "account" / "artifacts"
+    base = _extended(destination) / "account" / "artifacts"
+    base.mkdir(parents=True, exist_ok=True)
+    folders = NameAllocator(base)
+    mentions = _artifact_mentions(conversations, groups)
+    totals = {"artifacts": 0, "versions": 0, "files verified": 0, "failed verification": 0}
+    raw_items = []
+
+    for artifact_id in sorted(groups):
+        files = groups[artifact_id]
+        meta, notes = {}, []
+        record = next((name for inner, name in files.items()
+                       if len(inner) == 1 and inner[0].lower() == "artifact.json"), None)
+        if record:
+            try:
+                loaded = json.loads(archive.read(record))
+                meta = loaded if isinstance(loaded, dict) else {}
+            except ValueError:
+                notes.append("artifact.json is not valid JSON, so titles and dates are unknown.")
+        else:
+            notes.append("The archive has no artifact.json for this artifact.")
+
+        versions = _artifact_versions(files)
+        active = _active_version(meta, versions)
+        if meta.get("active_version") and meta["active_version"] not in versions:
+            notes.append(f"The version it names as current ({meta['active_version']}) is not in "
+                         f"the archive.")
+        listed = {v["id"]: v for v in _listed_versions(meta)}
+        title = (_as_text(listed.get(active, {}).get("title"))
+                 or next((_as_text(v.get("title")) for v in listed.values() if _as_text(v.get("title"))), "")
+                 or artifact_id)
+
+        checks = {}
+        for version, slot in versions.items():
+            if slot["manifest"]:
+                checks[version] = _verify_version(archive, files, version, slot["manifest"])
+        for version, (checked, problems) in checks.items():
+            totals["files verified"] += checked - len(problems)
+            totals["failed verification"] += len(problems)
+            for problem in problems[:5]:
+                print(f"WARNING: artifact {title!r}, version {version}: {problem}", file=sys.stderr)
+
+        folder = folders.allocate(safe_name(title))
+        folder.mkdir(parents=True, exist_ok=True)
+        allocators = {folder: NameAllocator(folder, reserved=("_versions.md",))}
+
+        def place(directory: Path, filename: str) -> Path:
+            if directory not in allocators:
+                directory.mkdir(parents=True, exist_ok=True)
+                allocators[directory] = NameAllocator(directory)
+            return allocators[directory].allocate(filename)
+
+        wrote = 0
+        slot = versions.get(active) if active else None
+        if slot:
+            if slot["page"]:
+                suffix = Path(slot["page"][-1]).suffix or ".html"
+                _copy_one(archive, files[slot["page"]], place(folder, safe_filename(title + suffix)))
+                wrote += 1
+            project = {rest[1:]: inner for rest, inner in slot["tree"].items()
+                       if rest[0].lower() == "project" and len(rest) > 1}
+            if slot["tree"] and not project:
+                # A typed version with no project/ folder: its page is the best there is.
+                page = next((inner for rest, inner in slot["tree"].items()
+                             if len(rest) == 1 and rest[0].lower() == "index.html"), None)
+                if page:
+                    project = {("index.html",): page}
+                notes.append("The current version has no project/ folder.")
+            for rest, inner in sorted(project.items()):
+                directory = folder.joinpath(*[safe_name(p) for p in rest[:-1]])
+                _copy_one(archive, files[inner], place(directory, safe_filename(rest[-1])))
+                wrote += 1
+
+        (folder / "_versions.md").write_text(
+            _render_artifact_index(artifact_id, meta, title, versions, active, checks,
+                                   mentions[artifact_id], notes, bool(wrote), faithful),
+            encoding="utf-8", errors="backslashreplace")
+
+        raw_items.extend((name, (artifact_id, *inner)) for inner, name in sorted(files.items()))
+        totals["artifacts"] += 1
+        totals["versions"] += len(versions)
+
+    print(f"\nArtifacts -> {shown}")
+    print("  " + ", ".join(f"{n} {k}" for k, n in totals.items() if n or k == "artifacts"))
+    if faithful:
+        count = _copy_entries(archive, raw_items, _extended(destination) / "raw" / "artifacts")
+        print(f"  {count} files -> {Path(destination) / 'raw' / 'artifacts'}")
     return totals
 
 

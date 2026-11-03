@@ -37,7 +37,8 @@ used as context for Claude Code work.
 ```
 
 Account-wide documents — monthly reflections, the conversations summary, every project's memory
-note and the memory files — are written once, under `account/` in the `--unfiled` directory,
+note, the memory files, scheduled routines (`account/routines/`) and published artifacts
+(`account/artifacts/`) — are written once, under `account/` in the `--unfiled` directory,
 whether or not `--faithful` is set. Without `--unfiled` they are written beside the first project
 only with `--faithful`, since they cover every project; each project folder still gets its own
 `_project_memory.md`.
@@ -54,12 +55,16 @@ user a worse result than the tool is capable of, without telling them.
 
 ### Step 1: Locate the ZIP
 
-Ask the user for the path to their Claude.ai export ZIP file. Common locations:
+Ask the user for the path to their Claude.ai export. Common locations:
 - `~/Downloads/`
 - `C:\Downloads\`
 - The user may have already mentioned it
 
-Verify the file exists before proceeding.
+Recent exports arrive as several ZIPs (one per category) rather than one. Pass them as they
+came — every ZIP, or the folder holding them — in place of `<zip_path>` below; do not unpack or
+repack them first.
+
+Verify the path exists before proceeding.
 
 ### Step 2: Offer exact conversation matching
 
