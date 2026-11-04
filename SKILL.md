@@ -139,6 +139,10 @@ Two more flags worth offering rather than assuming:
 
 - `--thinking` — also writes Claude's reasoning to `thinking/`. It was 3.3 MB against 4.2 MB of
   reply text on a measured export, so ask rather than deciding for them.
+- `--searchable` — for reading in Obsidian, a static site or with grep. Replaces the bullet header
+  with YAML front matter (title, id, project, how it was matched, dates, message count), prints the conversation's
+  own summary under the title, and puts a snippet of the message in each message heading.
+  Nothing else in the transcript changes.
 - `--faithful` — for archiving rather than reading. Implies `--thinking`, adds tool calls and
   their results, citations, the conversation's summary and file names to the transcripts, and
   writes every source record verbatim to `raw/`, so nothing in the export is lost.
